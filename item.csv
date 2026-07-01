@@ -1,0 +1,28 @@
+aorpo,aorpo,aorpo,aorpo,aorpo,uncertainty,uncertainty,uncertainty,uncertainty
+seed,run.name,run.path,run.id,,seed,run.name,run.path,run.id
+30,no routing aorpo rest_seed = 30 k = 6,yachen-tian-rwth-aachen-university/AORPO-dynamics model/076aeh46,076aeh46,,30,routing reset_seed = 30 k = 6 policy lr = 0.01,yachen-tian-rwth-aachen-university/AORPO-dynamics model/k217xrqp,k217xrqp
+40,no routing aorpo rest_seed = 40,yachen-tian-rwth-aachen-university/AORPO-dynamics model/yr331itg,yr331itg,,40,routing reset_seed = 40 k = 6,yachen-tian-rwth-aachen-university/AORPO-dynamics model/axoh0q85,axoh0q85
+45,no routing reset_seed = 45,yachen-tian-rwth-aachen-university/AORPO-dynamics model/zs5yt6l6,zs5yt6l6,bad,45,routing reset_seed = 45 k=6,yachen-tian-rwth-aachen-university/AORPO-dynamics model/zcvrnrpi,zcvrnrpi
+50,no routing aorpo reset_seed = 50 k = 6,yachen-tian-rwth-aachen-university/AORPO-dynamics model/8ixhtw37,8ixhtw37,bad,50,env_reset=50 uncertainty k=6,yachen-tian-rwth-aachen-university/AORPO-dynamics model/ybposc5q,ybposc5q
+55,no routing reset_seed = 55,yachen-tian-rwth-aachen-university/AORPO-dynamics model/djvdzln3,djvdzln3,,55,routing reset_seed = 55 k = 6 policy lr = 0.01,yachen-tian-rwth-aachen-university/AORPO-dynamics model/7m2xscks,7m2xscks
+65,no routing reset_seed = 65,yachen-tian-rwth-aachen-university/AORPO-dynamics model/zdcclxwl,zdcclxwl,,65,routing reset_seed = 65 k = 6 policy lr = 0.01,yachen-tian-rwth-aachen-university/AORPO-dynamics model/o6ic3h88,o6ic3h88
+,,,,,50,routing reset_seed  =50 k = 25,yachen-tian-rwth-aachen-university/AORPO-dynamics model/h378zhp4,h378zhp4
+,,,,,,,,
+,,,,,,,,
+,,,,,,,,
+aorpo,aorpo,aorpo,aorpo,aorpo,uncertainty,uncertainty,uncertainty,uncertainty
+seed,run.name,run.path,run.id,,seed,run.name,run.path,run.id
+40,env_reset=40 aorpo alpha50,yachen-tian-rwth-aachen-university/AORPO-simple_tag/yc5j624o,yc5j624o,,40,env_reset=40 uncertainty alpha50 q1e-3 quantile_opp: 0.95,yachen-tian-rwth-aachen-university/AORPO-simple_tag/ftaey7xg,ftaey7xg
+30,env_reset=30 aorpo alpha50,yachen-tian-rwth-aachen-university/AORPO-simple_tag/86bwq0c8,86bwq0c8,,30,env_reset=30 uncertainty alpha50 q1e-3 quantile_opp: 0.95,yachen-tian-rwth-aachen-university/AORPO-simple_tag/k05ey7b6,k05ey7b6
+45,env_reset=45 aorpo alpha50,yachen-tian-rwth-aachen-university/AORPO-simple_tag/aknz3xem,aknz3xem,,45,env_reset=45 uncertainty alpha50 q1e-3 quantile_opp: 0.95,yachen-tian-rwth-aachen-university/AORPO-simple_tag/9d4xr138,9d4xr138
+,,,,,,,,
+,,,,,,,,
+,,,,,,,,
+,,,,,,,,
+,,,,,,,,
+ablation,,,,,,,,
+un-comm,un-comm,un-comm,un-comm,un-comm,un-rollout,un-rollout,un-rollout,un-rollout
+seed,run.name,run.path,run.id,,seed,run.name,run.path,run.id
+30,env_reset=30 aorpo_rollout k,yachen-tian-rwth-aachen-university/AORPO-dynamics model/8c5416zq,8c5416zq,,30,env_reset=30 aorpo_comm,yachen-tian-rwth-aachen-university/AORPO-dynamics model/paputlrb,paputlrb
+40,env_reset=40 aorpo_rollout k,yachen-tian-rwth-aachen-university/AORPO-dynamics model/wba5cagq,wba5cagq,,40,env_reset=40 aorpo_comm,yachen-tian-rwth-aachen-university/AORPO-dynamics model/gvexr1bo,gvexr1bo
+45,env_reset=45 aorpo_rollout k,yachen-tian-rwth-aachen-university/AORPO-dynamics model/timh3i62,timh3i62,,45,env_reset=45 aorpo_comm,yachen-tian-rwth-aachen-university/AORPO-dynamics model/b9gby441,b9gby441

@@ -1,0 +1,29 @@
+# configs/agents/opponent_policy.yaml
+# ----------------------------------------------------------
+# Opponent Policy (π_φj) Configuration for AORPO
+# ----------------------------------------------------------
+
+# learning rate for opponent policy optimizer
+lr: 3e-4
+
+# hidden layer sizes (same structure as main policy)
+hidden_dims: [256, 256]
+
+# min/max log std for Gaussian policy
+min_logvar: -5.0
+max_logvar: 2.0
+
+# random seed (optional, for reproducibility)
+seed: 42
+
+# training schedule
+train:
+  batch_size: 256
+  num_updates: 10000
+  log_interval: 100
+
+# logging
+log:
+  verbose: true
+  save_model: true
+  save_interval: 1000

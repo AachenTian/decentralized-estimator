@@ -1,0 +1,61 @@
+seed: 0
+
+env:
+  seed_reset: 45
+  state_dim: 34
+  obs_dim: 18
+  act_dim: 5
+  ENV_NAME: MPE_simple_spread_v3
+
+replay:
+  capacity: 50000
+
+collect:
+  steps_per_epoch: 300  # 每个 epoch 真实环境的步数
+
+train:
+  epochs: 200
+  batch_size: 1024
+  batch_size_std: 300
+  model_updates: 50       # 每个 epoch 训练 dynamics 的次数
+  gradient_updates: 100   # 每个 epoch 用 D_model 的更新次数
+  opp_model_updates: 100  # 每个 epoch 更新 D_model 的更新次数
+  num_opponents: 2
+  num_landmark: 3
+  core_state_dim: 18
+  max_steps: 25
+  eval_interval: 1
+  reinit_opp_model: True
+
+rollout:
+  batch_size: 1024
+  k: 6                   # 公式里的 k（最长 rollout 步数）
+  quantile_opp: 0.99
+  zeta1: 0.99
+  zeta2: 0.01
+  xi: 30.0
+
+model_dynamics:
+  lr: 3e-4
+  num_members: 10
+  hidden_dims: [256, 256, 256, 256]
+  min_logvar: -10.0
+  max_logvar: 0.5
+
+q_function:
+  lr: 3e-4
+  gamma: 0.95
+  alpha: 0.2
+  tau: 0.005
+  hidden_dims: [256, 256]
+  act_dim: 2
+  agent_num: 3
+  reward_scale: 1
+
+policy:
+  lr: 0.01
+  hidden_dims: [64, 64, 64]
+  ensemble_size: 5
+  min_logvar: -5.0
+  max_logvar: 2.0
+  alpha: 0.2
