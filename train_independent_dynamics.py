@@ -9,6 +9,8 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import trange
 
 from aorpo.agents.independent_dynamics import (
+    extract_agent_action,
+    extract_local_kinematic_state,
     init_independent_transition_models,
     init_local_standardizers,
     make_local_transition_batch,
@@ -16,11 +18,20 @@ from aorpo.agents.independent_dynamics import (
     train_all_independent_models,
     update_local_standardizers,
 )
+
+from aorpo.estimator.uncertainty import (
+    compute_local_action_jacobian,
+    compute_local_state_jacobian,
+    covariance_trace_per_dim,
+    predict_local_mean_and_process_covariance,
+    propagate_local_covariance,
+)
+
 from aorpo.envs.jaxmarl_simple_spread_v3_env_wrapper import (
     env_step,
     make_mpe_env,
 )
-from aorpo.utils.replay import ReplayBuffer
+from aorpo.utils.replay import ReplayBuffer, manual_flatten_state
 
 
 def stack_pytrees(items: List[Any]) -> Any:
@@ -166,6 +177,7 @@ def evaluate_one_step(
 
     metrics: Dict[str, float] = {}
     all_mse = []
+    all_zero_delta_mse = []
 
     for agent_id in range(num_agents):
         local_batch = make_local_transition_batch(
@@ -186,6 +198,22 @@ def evaluate_one_step(
 
         target_next = local_batch["next_local_state"]
 
+        # Zero-delta / keep-state baseline:
+        # predict z_{t+1} = z_t
+        baseline_next = local_batch["local_state"]
+
+        zero_delta_mse = jnp.mean(
+            (baseline_next - target_next) ** 2
+        )
+
+        zero_delta_pos_mse = jnp.mean(
+            (baseline_next[:, :2] - target_next[:, :2]) ** 2
+        )
+
+        zero_delta_vel_mse = jnp.mean(
+            (baseline_next[:, 2:] - target_next[:, 2:]) ** 2
+        )
+
         mse = jnp.mean((pred_next - target_next) ** 2)
         pos_mse = jnp.mean(
             (pred_next[:, :2] - target_next[:, :2]) ** 2
@@ -203,12 +231,351 @@ def evaluate_one_step(
             mean_total_var
         )
 
+        metrics[f"agent_{agent_id}/zero_delta_mse"] = float(
+            zero_delta_mse
+        )
+        metrics[f"agent_{agent_id}/zero_delta_position_mse"] = float(
+            zero_delta_pos_mse
+        )
+        metrics[f"agent_{agent_id}/zero_delta_velocity_mse"] = float(
+            zero_delta_vel_mse
+        )
+
         all_mse.append(mse)
+        all_zero_delta_mse.append(zero_delta_mse)
 
     metrics["mean_one_step_mse"] = float(jnp.mean(jnp.stack(all_mse)))
+    metrics["mean_zero_delta_mse"] = float(
+        jnp.mean(jnp.stack(all_zero_delta_mse))
+    )
 
     return metrics, key
 
+def flatten_trajectory_states(
+    trajectory_batch: Dict[str, Any],
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Convert a collected trajectory into flattened state arrays.
+
+    The collector stores JAXMarl State pytrees, while the local dynamics
+    utilities expect arrays with shape (T, full_state_dim).
+    """
+    raw_state = trajectory_batch.get("state")
+    raw_next_state = trajectory_batch.get("next_state")
+
+    if raw_state is None:
+        raise ValueError(
+            "trajectory_batch['state'] is None. "
+            "Check where eval_batch is assigned before multi-step evaluation."
+        )
+
+    if raw_next_state is None:
+        raise ValueError(
+            "trajectory_batch['next_state'] is None. "
+            "Check where eval_batch is assigned before multi-step evaluation."
+        )
+
+    if hasattr(raw_state, "p_pos"):
+        flat_state = jax.vmap(manual_flatten_state)(raw_state)
+        flat_next_state = jax.vmap(manual_flatten_state)(raw_next_state)
+    else:
+        flat_state = jnp.asarray(raw_state)
+        flat_next_state = jnp.asarray(raw_next_state)
+
+    if flat_state.ndim != 2:
+        raise ValueError(
+            f"Expected flat state trajectory with shape (T, D), got {flat_state.shape}."
+        )
+
+    if flat_next_state.ndim != 2:
+        raise ValueError(
+            "Expected flat next-state trajectory with shape (T, D), "
+            f"got {flat_next_state.shape}."
+        )
+
+    return flat_state, flat_next_state
+
+
+def find_valid_rollout_starts(
+    flat_states: jnp.ndarray,
+    flat_next_states: jnp.ndarray,
+    horizon: int,
+) -> List[int]:
+    """
+    Find rollout starts whose horizon does not cross an environment reset.
+    """
+    if horizon < 1:
+        raise ValueError(f"horizon must be at least 1, got {horizon}.")
+
+    state_steps = flat_states[:, -1]
+    next_steps = flat_next_states[:, -1]
+
+    total_steps = int(flat_states.shape[0])
+    valid_starts = []
+
+    for start in range(total_steps - horizon + 1):
+        if horizon == 1:
+            valid_starts.append(start)
+            continue
+
+        is_continuous = jnp.all(
+            state_steps[start + 1:start + horizon]
+            == next_steps[start:start + horizon - 1]
+        )
+
+        if bool(is_continuous):
+            valid_starts.append(start)
+
+    return valid_starts
+
+def make_isotropic_action_covariance(
+    batch_size: int,
+    action_dim: int,
+    action_variance: float,
+    dtype: jnp.dtype,
+) -> jnp.ndarray:
+    """
+    Create a manually specified isotropic action covariance.
+
+    This helper is only a placeholder for future experiments.
+    It should later be replaced by a covariance derived from
+    the synchronized stochastic policy.
+    """
+    if action_variance < 0.0:
+        raise ValueError(
+            f"action_variance must be non-negative, got {action_variance}."
+        )
+
+    covariance = action_variance * jnp.eye(
+        action_dim,
+        dtype=dtype,
+    )
+
+    return jnp.broadcast_to(
+        covariance,
+        (batch_size, action_dim, action_dim),
+    )
+
+
+def evaluate_multistep_oracle_actions(
+    model_states: List[Any],
+    standardizers: List[Any],
+    trajectory_batch: Dict[str, Any],
+    cfg: DictConfig,
+    horizon: int,
+    num_rollouts: int,
+    include_action_uncertainty: bool,
+    manual_action_variance: float,
+    initial_measurement_variance: float,
+) -> Dict[str, jnp.ndarray]:
+    """
+    Evaluate multi-step local dynamics rollouts with covariance propagation.
+
+    The rollout starts from the real local state. This represents a state
+    estimate immediately after direct communication or direct observation.
+
+    Actions are taken from the recorded real trajectory. Therefore,
+    include_action_uncertainty should normally be False in this evaluation.
+
+    When include_action_uncertainty is enabled, a manually specified
+    isotropic action covariance is used as a temporary placeholder.
+    """
+    num_agents = cfg.train.num_opponents + 1
+    num_landmarks = cfg.train.num_landmark
+    act_dim = cfg.env.act_dim
+
+    flat_states, flat_next_states = flatten_trajectory_states(
+        trajectory_batch
+    )
+
+    valid_starts = find_valid_rollout_starts(
+        flat_states=flat_states,
+        flat_next_states=flat_next_states,
+        horizon=horizon,
+    )
+
+    if not valid_starts:
+        raise RuntimeError(
+            "No valid contiguous rollout segments were found. "
+            "Try reducing rollout_horizon."
+        )
+
+    stride = max(1, len(valid_starts) // num_rollouts)
+    selected_starts = valid_starts[::stride][:num_rollouts]
+
+    if not selected_starts:
+        raise RuntimeError("No rollout start was selected.")
+
+    metrics: Dict[str, jnp.ndarray] = {}
+
+    for agent_id in range(num_agents):
+        true_states = extract_local_kinematic_state(
+            flat_state=flat_states,
+            agent_id=agent_id,
+            num_agents=num_agents,
+            num_landmarks=num_landmarks,
+        )
+
+        true_next_states = extract_local_kinematic_state(
+            flat_state=flat_next_states,
+            agent_id=agent_id,
+            num_agents=num_agents,
+            num_landmarks=num_landmarks,
+        )
+
+        true_actions = extract_agent_action(
+            batch=trajectory_batch,
+            agent_id=agent_id,
+            num_agents=num_agents,
+            act_dim=act_dim,
+        )
+
+        total_mse_by_horizon = [[] for _ in range(horizon)]
+        position_mse_by_horizon = [[] for _ in range(horizon)]
+        velocity_mse_by_horizon = [[] for _ in range(horizon)]
+
+        estimated_mse_by_horizon = [[] for _ in range(horizon)]
+        covariance_trace_by_horizon = [[] for _ in range(horizon)]
+
+        for start in selected_starts:
+            predicted_state = true_states[start:start + 1]
+
+            state_dim = predicted_state.shape[-1]
+
+            predicted_covariance = (
+                initial_measurement_variance
+                * jnp.eye(
+                    state_dim,
+                    dtype=predicted_state.dtype,
+                )
+            )[None, ...]
+
+            for h in range(horizon):
+                action_t = true_actions[
+                    start + h:start + h + 1
+                ]
+
+                current_predicted_state = predicted_state
+
+                predicted_state, process_covariance, _ = (
+                    predict_local_mean_and_process_covariance(
+                        train_state=model_states[agent_id],
+                        standardizer=standardizers[agent_id],
+                        local_state=current_predicted_state,
+                        local_action=action_t,
+                    )
+                )
+
+                state_jacobian = compute_local_state_jacobian(
+                    train_state=model_states[agent_id],
+                    standardizer=standardizers[agent_id],
+                    local_state=current_predicted_state,
+                    local_action=action_t,
+                )
+
+                if include_action_uncertainty:
+                    action_jacobian = compute_local_action_jacobian(
+                        train_state=model_states[agent_id],
+                        standardizer=standardizers[agent_id],
+                        local_state=current_predicted_state,
+                        local_action=action_t,
+                    )
+
+                    action_covariance = make_isotropic_action_covariance(
+                        batch_size=1,
+                        action_dim=act_dim,
+                        action_variance=manual_action_variance,
+                        dtype=predicted_state.dtype,
+                    )
+
+                    predicted_covariance = propagate_local_covariance(
+                        state_covariance=predicted_covariance,
+                        state_jacobian=state_jacobian,
+                        process_covariance=process_covariance,
+                        action_jacobian=action_jacobian,
+                        action_covariance=action_covariance,
+                        include_action_uncertainty=True,
+                    )
+                else:
+                    predicted_covariance = propagate_local_covariance(
+                        state_covariance=predicted_covariance,
+                        state_jacobian=state_jacobian,
+                        process_covariance=process_covariance,
+                        include_action_uncertainty=False,
+                    )
+
+                target_state = true_next_states[
+                    start + h:start + h + 1
+                ]
+
+                error = predicted_state - target_state
+
+                total_mse_by_horizon[h].append(
+                    jnp.mean(error ** 2)
+                )
+
+                position_mse_by_horizon[h].append(
+                    jnp.mean(error[:, :2] ** 2)
+                )
+
+                velocity_mse_by_horizon[h].append(
+                    jnp.mean(error[:, 2:] ** 2)
+                )
+
+                estimated_mse = covariance_trace_per_dim(
+                    predicted_covariance
+                )[0]
+
+                covariance_trace = jnp.trace(
+                    predicted_covariance[0]
+                )
+
+                estimated_mse_by_horizon[h].append(
+                    estimated_mse
+                )
+
+                covariance_trace_by_horizon[h].append(
+                    covariance_trace
+                )
+
+        metrics[f"agent_{agent_id}/multistep_mse"] = jnp.asarray(
+            [
+                jnp.mean(jnp.asarray(values))
+                for values in total_mse_by_horizon
+            ]
+        )
+
+        metrics[f"agent_{agent_id}/multistep_position_mse"] = jnp.asarray(
+            [
+                jnp.mean(jnp.asarray(values))
+                for values in position_mse_by_horizon
+            ]
+        )
+
+        metrics[f"agent_{agent_id}/multistep_velocity_mse"] = jnp.asarray(
+            [
+                jnp.mean(jnp.asarray(values))
+                for values in velocity_mse_by_horizon
+            ]
+        )
+
+        metrics[f"agent_{agent_id}/estimated_mse_from_covariance"] = (
+            jnp.asarray(
+                [
+                    jnp.mean(jnp.asarray(values))
+                    for values in estimated_mse_by_horizon
+                ]
+            )
+        )
+
+        metrics[f"agent_{agent_id}/covariance_trace"] = jnp.asarray(
+            [
+                jnp.mean(jnp.asarray(values))
+                for values in covariance_trace_by_horizon
+            ]
+        )
+
+    return metrics
 
 @hydra.main(
     config_path="aorpo/configs",
@@ -233,6 +600,26 @@ def main(cfg: DictConfig) -> None:
     gradient_steps = int(cfg.independent_dynamics.gradient_steps)
     batch_size = int(cfg.independent_dynamics.batch_size)
     eval_interval = int(cfg.independent_dynamics.eval_interval)
+
+    rollout_horizon = int(
+        cfg.independent_dynamics.rollout_horizon
+    )
+
+    rollout_num_starts = int(
+        cfg.independent_dynamics.rollout_num_starts
+    )
+
+    include_action_uncertainty = bool(
+        cfg.independent_dynamics.include_action_uncertainty
+    )
+
+    manual_action_variance = float(
+        cfg.independent_dynamics.manual_action_variance
+    )
+
+    initial_measurement_variance = float(
+        cfg.independent_dynamics.initial_measurement_variance
+    )
 
     print(
         f"\nAgents={num_agents} | "
@@ -383,20 +770,113 @@ def main(cfg: DictConfig) -> None:
 
             print(
                 f"mean one-step MSE: "
-                f"{eval_metrics['mean_one_step_mse']:.7f}"
+                f"{eval_metrics['mean_one_step_mse']:.7f} | "
+                f"zero-delta baseline MSE: "
+                f"{eval_metrics['mean_zero_delta_mse']:.7f}"
             )
 
             for agent_id in range(num_agents):
                 print(
                     f"agent_{agent_id} | "
-                    f"pos MSE: "
+                    f"model pos MSE: "
                     f"{eval_metrics[f'agent_{agent_id}/position_mse']:.7f} | "
-                    f"vel MSE: "
+                    f"model vel MSE: "
                     f"{eval_metrics[f'agent_{agent_id}/velocity_mse']:.7f} | "
+                    f"zero-delta MSE: "
+                    f"{eval_metrics[f'agent_{agent_id}/zero_delta_mse']:.7f} | "
                     f"mean variance(norm): "
                     f"{eval_metrics[f'agent_{agent_id}/mean_total_var_norm']:.7f}"
                 )
+    print("\n===== Multi-step rollout evaluation: oracle actions =====")
 
+    rollout_horizon = int(
+        cfg.independent_dynamics.rollout_horizon
+    )
+
+    rollout_num_starts = int(
+        cfg.independent_dynamics.rollout_num_starts
+    )
+
+    if eval_batch is None:
+        raise RuntimeError("eval_batch is None before multi-step evaluation.")
+
+    if eval_batch.get("state") is None:
+        raise RuntimeError(
+            "eval_batch['state'] is None before multi-step evaluation."
+        )
+
+    if eval_batch.get("next_state") is None:
+        raise RuntimeError(
+            "eval_batch['next_state'] is None before multi-step evaluation."
+        )
+
+    print(
+        "\n===== Multi-step rollout evaluation with "
+        "EKF-style covariance propagation ====="
+    )
+
+    print(
+        f"Action uncertainty enabled: "
+        f"{include_action_uncertainty}"
+    )
+
+    if include_action_uncertainty:
+        print(
+            f"Manual action variance: "
+            f"{manual_action_variance:.6e}"
+        )
+
+    multistep_metrics = evaluate_multistep_oracle_actions(
+        model_states=model_states,
+        standardizers=local_standardizers,
+        trajectory_batch=eval_batch,
+        cfg=cfg,
+        horizon=rollout_horizon,
+        num_rollouts=rollout_num_starts,
+        include_action_uncertainty=include_action_uncertainty,
+        manual_action_variance=manual_action_variance,
+        initial_measurement_variance=initial_measurement_variance,
+    )
+
+    report_horizons = [
+        h for h in [1, 5, 10, rollout_horizon]
+        if h <= rollout_horizon
+    ]
+
+    for agent_id in range(num_agents):
+        mse_curve = multistep_metrics[
+            f"agent_{agent_id}/multistep_mse"
+        ]
+
+        pos_curve = multistep_metrics[
+            f"agent_{agent_id}/multistep_position_mse"
+        ]
+
+        vel_curve = multistep_metrics[
+            f"agent_{agent_id}/multistep_velocity_mse"
+        ]
+
+        estimated_mse_curve = multistep_metrics[
+            f"agent_{agent_id}/estimated_mse_from_covariance"
+        ]
+
+        covariance_trace_curve = multistep_metrics[
+            f"agent_{agent_id}/covariance_trace"
+        ]
+
+        print(f"\nagent_{agent_id}:")
+
+        for horizon_step in report_horizons:
+            index = horizon_step - 1
+
+            print(
+                f"  horizon={horizon_step:2d} | "
+                f"MSE={float(mse_curve[index]):.6f} | "
+                f"position MSE={float(pos_curve[index]):.6f} | "
+                f"velocity MSE={float(vel_curve[index]):.6f} | "
+                f"estimated MSE from P={float(estimated_mse_curve[index]):.6f} | "
+                f"trace(P)={float(covariance_trace_curve[index]):.6f}"
+            )
     print("\nIndependent dynamics training finished.")
 
 

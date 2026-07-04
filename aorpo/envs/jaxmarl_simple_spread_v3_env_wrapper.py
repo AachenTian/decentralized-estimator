@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 from aorpo.visualiztion.make_animation import animate_episode
 
 def make_mpe_env(cfg: DictConfig):
-    env = make(cfg.env.ENV_NAME, action_type="Continuous", u_noise=jnp.array([5.00, 5.00, 5.00]),)    #"MPE_simple_v3"
+    env = make(cfg.env.ENV_NAME, action_type="Continuous", u_noise=jnp.array([1.00, 1.00, 1.00]),)    #"MPE_simple_v3"
     return env
 
 def env_reset(env, key):

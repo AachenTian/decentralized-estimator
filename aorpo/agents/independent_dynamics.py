@@ -676,3 +676,30 @@ def predict_local_next(
     }
 
     return next_local_state, prediction_info
+
+def predict_local_mean(
+    train_state: TrainState,
+    standardizer: LocalStandardizerRS,
+    local_state: jnp.ndarray,
+    local_action: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Return the ensemble mean prediction in physical state coordinates.
+    """
+    state_norm = standardizer.norm_local_state(local_state)
+    action_norm = standardizer.norm_action(local_action)
+
+    model_input = jnp.concatenate(
+        [state_norm, action_norm],
+        axis=-1,
+    )
+
+    ensemble_mu_norm, _ = train_state.apply_fn(
+        {"params": train_state.params},
+        model_input,
+    )
+
+    mean_delta_norm = jnp.mean(ensemble_mu_norm, axis=0)
+    mean_delta = standardizer.denorm_delta(mean_delta_norm)
+
+    return local_state + mean_delta

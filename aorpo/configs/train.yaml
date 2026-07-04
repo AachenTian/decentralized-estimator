@@ -66,3 +66,10 @@ independent_dynamics:
   gradient_steps: 1000
   batch_size: 1024
   eval_interval: 100
+  rollout_horizon: 20
+  rollout_num_starts: 100
+
+  initial_measurement_variance: 1.0e-8
+
+  include_action_uncertainty: false
+  manual_action_variance: 0.0
