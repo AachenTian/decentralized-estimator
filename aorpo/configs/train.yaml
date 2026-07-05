@@ -73,3 +73,6 @@ independent_dynamics:
 
   include_action_uncertainty: false
   manual_action_variance: 0.0
+  
+  checkpoint_path: checkpoints/independent_dynamics.pkl
+  save_checkpoint: true

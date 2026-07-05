@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from omegaconf import OmegaConf
+
 import hydra
 import jax
 import jax.numpy as jnp
@@ -33,6 +35,9 @@ from aorpo.envs.jaxmarl_simple_spread_v3_env_wrapper import (
 )
 from aorpo.utils.replay import ReplayBuffer, manual_flatten_state
 
+from aorpo.utils.checkpoints import (
+    save_independent_dynamics_checkpoint,
+)
 
 def stack_pytrees(items: List[Any]) -> Any:
     """Stack a list of JAX pytrees along the first axis."""
@@ -621,6 +626,14 @@ def main(cfg: DictConfig) -> None:
         cfg.independent_dynamics.initial_measurement_variance
     )
 
+    checkpoint_path = str(
+        cfg.independent_dynamics.checkpoint_path
+    )
+
+    save_checkpoint = bool(
+        cfg.independent_dynamics.save_checkpoint
+    )
+
     print(
         f"\nAgents={num_agents} | "
         f"landmarks={num_landmarks} | "
@@ -877,6 +890,26 @@ def main(cfg: DictConfig) -> None:
                 f"estimated MSE from P={float(estimated_mse_curve[index]):.6f} | "
                 f"trace(P)={float(covariance_trace_curve[index]):.6f}"
             )
+
+    if save_checkpoint:
+        checkpoint_metadata = {
+            "num_agents": int(num_agents),
+            "num_landmarks": int(cfg.train.num_landmark),
+            "action_dim": int(cfg.env.act_dim),
+            "local_state_dim": 4,
+            "training_config": OmegaConf.to_container(
+                cfg,
+                resolve=True,
+            ),
+        }
+
+        save_independent_dynamics_checkpoint(
+            checkpoint_path=checkpoint_path,
+            model_states=model_states,
+            standardizers=local_standardizers,
+            metadata=checkpoint_metadata,
+        )
+        
     print("\nIndependent dynamics training finished.")
 
 
