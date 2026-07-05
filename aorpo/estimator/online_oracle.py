@@ -21,7 +21,9 @@ from aorpo.estimator.global_belief import (
 )
 from aorpo.estimator.uncertainty import covariance_trace_per_dim
 
-
+from aorpo.estimator.trigger import (
+    trace_threshold_trigger,
+)
 
 def extract_true_local_physical_states(
     env_state: Any,
@@ -68,15 +70,15 @@ def build_action_dict(
     }
 
 
-def should_communicate(
+def should_scheduled_communication(
     communication_mode: str,
     step_index: int,
     periodic_interval: int,
 ) -> bool:
     """
-    Decide whether all remote agents communicate at the current step.
+    Decide whether scheduled communication occurs at the current step.
 
-    Supported modes:
+    Supported scheduled modes:
         initial_sync_only
         always_communicate
         periodic
@@ -97,9 +99,71 @@ def should_communicate(
         return (step_index + 1) % periodic_interval == 0
 
     raise ValueError(
+        "Unsupported scheduled communication mode: "
+        f"{communication_mode}."
+    )
+
+
+def decide_remote_communications(
+    communication_mode: str,
+    belief_before_remote_messages: GlobalBelief,
+    remote_agent_ids: Sequence[int],
+    step_index: int,
+    periodic_interval: int,
+    event_trigger_threshold: float,
+    num_agents: int,
+    local_state_dim: int,
+) -> Dict[int, bool]:
+    """
+    Decide communication independently for each remote agent.
+
+    Event-trigger decisions are evaluated using the same belief before any
+    remote measurement update is applied. This makes the trigger decisions
+    independent of the sequential update order.
+    """
+    scheduled_modes = {
+        "initial_sync_only",
+        "always_communicate",
+        "periodic",
+    }
+
+    if communication_mode in scheduled_modes:
+        scheduled_decision = should_scheduled_communication(
+            communication_mode=communication_mode,
+            step_index=step_index,
+            periodic_interval=periodic_interval,
+        )
+
+        return {
+            remote_agent_id: scheduled_decision
+            for remote_agent_id in remote_agent_ids
+        }
+
+    if communication_mode == "event_triggered":
+        decisions: Dict[int, bool] = {}
+
+        for remote_agent_id in remote_agent_ids:
+            remote_covariance = extract_agent_covariance(
+                belief=belief_before_remote_messages,
+                agent_id=remote_agent_id,
+                num_agents=num_agents,
+                local_state_dim=local_state_dim,
+            )
+
+            decisions[remote_agent_id] = bool(
+                trace_threshold_trigger(
+                    covariance=remote_covariance,
+                    threshold=event_trigger_threshold,
+                )[0]
+            )
+
+        return decisions
+
+    raise ValueError(
         "Unsupported communication_mode: "
         f"{communication_mode}. "
-        "Expected one of: initial_sync_only, always_communicate, periodic."
+        "Expected one of: initial_sync_only, always_communicate, "
+        "periodic, event_triggered."
     )
 
 
@@ -147,6 +211,10 @@ def run_online_oracle_global_belief_evaluation(
         cfg.online_estimator.periodic_interval
     )
 
+    event_trigger_threshold = float(
+        cfg.online_estimator.event_trigger_threshold
+    )
+
     initial_variance = float(
         cfg.online_estimator.initial_variance
     )
@@ -181,6 +249,12 @@ def run_online_oracle_global_belief_evaluation(
             f"Received {action_min} and {action_max}."
         )
 
+    if event_trigger_threshold < 0.0:
+        raise ValueError(
+            "event_trigger_threshold must be non-negative, "
+            f"got {event_trigger_threshold}."
+        )
+
     env = make_mpe_env(cfg)
 
     rng = jax.random.PRNGKey(
@@ -202,6 +276,11 @@ def run_online_oracle_global_belief_evaluation(
     total_remote_messages = 0
     total_environment_steps = 0
 
+    remote_message_counts = {
+        remote_agent_id: 0
+        for remote_agent_id in remote_agent_ids
+    }
+
     print(
         "\n===== Online Global Belief Evaluation "
         "with Oracle Actions ====="
@@ -210,6 +289,13 @@ def run_online_oracle_global_belief_evaluation(
     print(f"Ego receiver agent: {ego_agent_id}")
     print(f"Communication mode: {communication_mode}")
     print(f"Number of episodes: {num_episodes}")
+
+    if communication_mode == "event_triggered":
+        print(
+            "Event trigger threshold "
+            f"(trace(P_jj) / local_state_dim): "
+            f"{event_trigger_threshold:.6f}"
+        )
 
     for episode_index in range(num_episodes):
         rng, reset_key = jax.random.split(rng)
@@ -289,9 +375,11 @@ def run_online_oracle_global_belief_evaluation(
                 local_state_dim=local_state_dim,
             )
 
+            pre_communication_belief = belief
+
             for remote_agent_id in remote_agent_ids:
                 estimated_remote_state = extract_agent_state(
-                    belief=belief,
+                    belief=pre_communication_belief,
                     agent_id=remote_agent_id,
                     num_agents=num_agents,
                     local_state_dim=local_state_dim,
@@ -306,7 +394,7 @@ def run_online_oracle_global_belief_evaluation(
                 )
 
                 remote_covariance = extract_agent_covariance(
-                    belief=belief,
+                    belief=pre_communication_belief,
                     agent_id=remote_agent_id,
                     num_agents=num_agents,
                     local_state_dim=local_state_dim,
@@ -324,27 +412,35 @@ def run_online_oracle_global_belief_evaluation(
                     float(covariance_proxy)
                 )
 
-            communicate_now = should_communicate(
+            communication_decisions = decide_remote_communications(
                 communication_mode=communication_mode,
+                belief_before_remote_messages=pre_communication_belief,
+                remote_agent_ids=remote_agent_ids,
                 step_index=step_index,
                 periodic_interval=periodic_interval,
+                event_trigger_threshold=event_trigger_threshold,
+                num_agents=num_agents,
+                local_state_dim=local_state_dim,
             )
 
-            if communicate_now:
-                for remote_agent_id in remote_agent_ids:
-                    belief, _ = direct_agent_observation_update(
-                        predicted_belief=belief,
-                        observed_agent_id=remote_agent_id,
-                        measurement=true_next_local_states[
-                            remote_agent_id
-                        ][None, ...],
-                        measurement_covariance=measurement_covariance,
-                        num_agents=num_agents,
-                        local_state_dim=local_state_dim,
-                    )
+            for remote_agent_id in remote_agent_ids:
+                if not communication_decisions[remote_agent_id]:
+                    continue
 
-                    total_remote_messages += 1
-                    episode_message_count += 1
+                belief, _ = direct_agent_observation_update(
+                    predicted_belief=belief,
+                    observed_agent_id=remote_agent_id,
+                    measurement=true_next_local_states[
+                        remote_agent_id
+                    ][None, ...],
+                    measurement_covariance=measurement_covariance,
+                    num_agents=num_agents,
+                    local_state_dim=local_state_dim,
+                )
+
+                total_remote_messages += 1
+                remote_message_counts[remote_agent_id] += 1
+                episode_message_count += 1
 
             for remote_agent_id in remote_agent_ids:
                 estimated_remote_state = extract_agent_state(
@@ -412,8 +508,10 @@ def run_online_oracle_global_belief_evaluation(
     metrics = {
         "communication_mode": communication_mode,
         "ego_agent_id": ego_agent_id,
+        "event_trigger_threshold": event_trigger_threshold,
         "total_environment_steps": total_environment_steps,
         "total_remote_messages": total_remote_messages,
+        "remote_message_counts": remote_message_counts,
         "remote_message_rate": remote_message_rate,
         "mean_pre_update_remote_mse": mean_or_nan(
             pre_update_remote_mse_values
@@ -465,5 +563,11 @@ def run_online_oracle_global_belief_evaluation(
     print(
         f"Remote message rate: {remote_message_rate:.4f}"
     )
+
+    for remote_agent_id in remote_agent_ids:
+        print(
+            f"Messages from agent_{remote_agent_id}: "
+            f"{remote_message_counts[remote_agent_id]}"
+        )
 
     return metrics

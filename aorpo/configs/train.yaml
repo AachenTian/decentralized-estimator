@@ -86,6 +86,7 @@ online_estimator:
 
   communication_mode: initial_sync_only
   periodic_interval: 5
+  event_trigger_threshold: 0.20
 
   initial_variance: 1.0e-8
   measurement_variance: 1.0e-8
