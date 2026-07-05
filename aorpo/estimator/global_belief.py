@@ -1,11 +1,17 @@
 # aorpo/estimator/global_belief.py
 from __future__ import annotations
 
-from typing import Dict, NamedTuple, Tuple
+from typing import Dict, NamedTuple, Sequence, Tuple
 
 import jax.numpy as jnp
+from flax.training.train_state import TrainState
 
-from aorpo.estimator.uncertainty import symmetrize_covariance
+from aorpo.agents.independent_dynamics import LocalStandardizerRS
+from aorpo.estimator.uncertainty import (
+    compute_local_state_jacobian,
+    predict_local_mean_and_process_covariance,
+    symmetrize_covariance,
+)
 
 
 class GlobalBelief(NamedTuple):
@@ -305,6 +311,60 @@ def assemble_block_diagonal_covariance(
 
     return global_covariance
 
+def assemble_block_diagonal_matrices(
+    local_matrices: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Assemble block-diagonal matrices from local square blocks.
+
+    Args:
+        local_matrices:
+            Local square matrices with shape (B, N, D, D).
+
+    Returns:
+        Block-diagonal matrices with shape (B, N * D, N * D).
+    """
+    if local_matrices.ndim != 4:
+        raise ValueError(
+            "local_matrices must have shape (B, N, D, D), "
+            f"got {local_matrices.shape}."
+        )
+
+    batch_size, num_agents, local_dim, second_dim = (
+        local_matrices.shape
+    )
+
+    if local_dim != second_dim:
+        raise ValueError(
+            "Each local matrix must be square, "
+            f"got {local_matrices.shape}."
+        )
+
+    total_dim = global_state_dim(
+        num_agents=num_agents,
+        local_state_dim=local_dim,
+    )
+
+    global_matrix = jnp.zeros(
+        (batch_size, total_dim, total_dim),
+        dtype=local_matrices.dtype,
+    )
+
+    for agent_id in range(num_agents):
+        state_slice = agent_state_slice(
+            agent_id=agent_id,
+            num_agents=num_agents,
+            local_state_dim=local_dim,
+        )
+
+        global_matrix = global_matrix.at[
+            :,
+            state_slice,
+            state_slice,
+        ].set(local_matrices[:, agent_id])
+
+    return global_matrix
+
 
 def make_agent_selection_matrix(
     agent_id: int,
@@ -571,3 +631,215 @@ def direct_agent_observation_update(
     }
 
     return posterior_belief, update_info
+
+def predict_global_belief_oracle_actions(
+    belief: GlobalBelief,
+    model_states: Sequence[TrainState],
+    standardizers: Sequence[LocalStandardizerRS],
+    joint_actions: jnp.ndarray,
+    num_agents: int,
+    local_state_dim: int,
+) -> Tuple[GlobalBelief, Dict[str, jnp.ndarray]]:
+    """
+    Predict a full global belief using independent local dynamics models.
+
+    The physical dynamics are factorized across agents, while the global
+    covariance remains full. This function uses known oracle joint actions.
+
+    Args:
+        belief:
+            Current full global Gaussian belief.
+
+        model_states:
+            One trained local dynamics model state per agent.
+
+        standardizers:
+            One local dynamics standardizer per agent.
+
+        joint_actions:
+            Known actions with shape (B, N, A).
+
+        num_agents:
+            Number of agents.
+
+        local_state_dim:
+            Physical state dimension of one agent.
+
+    Returns:
+        predicted_belief:
+            Predicted global belief after one dynamics step.
+
+        prediction_info:
+            Diagnostics containing local and global Jacobians and
+            process covariance matrices.
+    """
+    if len(model_states) != num_agents:
+        raise ValueError(
+            "model_states must contain one model per agent. "
+            f"Expected {num_agents}, got {len(model_states)}."
+        )
+
+    if len(standardizers) != num_agents:
+        raise ValueError(
+            "standardizers must contain one standardizer per agent. "
+            f"Expected {num_agents}, got {len(standardizers)}."
+        )
+
+    if belief.mean.ndim != 2:
+        raise ValueError(
+            "belief.mean must have shape (B, S), "
+            f"got {belief.mean.shape}."
+        )
+
+    if belief.covariance.ndim != 3:
+        raise ValueError(
+            "belief.covariance must have shape (B, S, S), "
+            f"got {belief.covariance.shape}."
+        )
+
+    batch_size = belief.mean.shape[0]
+
+    state_dim = global_state_dim(
+        num_agents=num_agents,
+        local_state_dim=local_state_dim,
+    )
+
+    if belief.mean.shape != (batch_size, state_dim):
+        raise ValueError(
+            "belief.mean has an unexpected shape. "
+            f"Expected ({batch_size}, {state_dim}), "
+            f"got {belief.mean.shape}."
+        )
+
+    if belief.covariance.shape != (
+        batch_size,
+        state_dim,
+        state_dim,
+    ):
+        raise ValueError(
+            "belief.covariance has an unexpected shape. "
+            f"Expected ({batch_size}, {state_dim}, {state_dim}), "
+            f"got {belief.covariance.shape}."
+        )
+
+    if joint_actions.ndim != 3:
+        raise ValueError(
+            "joint_actions must have shape (B, N, A), "
+            f"got {joint_actions.shape}."
+        )
+
+    if joint_actions.shape[0] != batch_size:
+        raise ValueError(
+            "joint_actions batch size must match belief batch size. "
+            f"Got {joint_actions.shape[0]} and {batch_size}."
+        )
+
+    if joint_actions.shape[1] != num_agents:
+        raise ValueError(
+            "joint_actions agent dimension must match num_agents. "
+            f"Expected {num_agents}, got {joint_actions.shape[1]}."
+        )
+
+    local_next_means = []
+    local_state_jacobians = []
+    local_process_covariances = []
+    local_aleatoric_covariances = []
+    local_epistemic_covariances = []
+
+    for agent_id in range(num_agents):
+        local_state = extract_agent_state(
+            belief=belief,
+            agent_id=agent_id,
+            num_agents=num_agents,
+            local_state_dim=local_state_dim,
+        )
+
+        local_action = joint_actions[:, agent_id, :]
+
+        next_local_state, process_covariance, covariance_info = (
+            predict_local_mean_and_process_covariance(
+                train_state=model_states[agent_id],
+                standardizer=standardizers[agent_id],
+                local_state=local_state,
+                local_action=local_action,
+            )
+        )
+
+        state_jacobian = compute_local_state_jacobian(
+            train_state=model_states[agent_id],
+            standardizer=standardizers[agent_id],
+            local_state=local_state,
+            local_action=local_action,
+        )
+
+        local_next_means.append(next_local_state)
+        local_state_jacobians.append(state_jacobian)
+        local_process_covariances.append(process_covariance)
+
+        local_aleatoric_covariances.append(
+            covariance_info["aleatoric_cov"]
+        )
+
+        local_epistemic_covariances.append(
+            covariance_info["epistemic_cov"]
+        )
+
+    predicted_mean = jnp.concatenate(
+        local_next_means,
+        axis=-1,
+    )
+
+    local_state_jacobians = jnp.stack(
+        local_state_jacobians,
+        axis=1,
+    )
+
+    local_process_covariances = jnp.stack(
+        local_process_covariances,
+        axis=1,
+    )
+
+    local_aleatoric_covariances = jnp.stack(
+        local_aleatoric_covariances,
+        axis=1,
+    )
+
+    local_epistemic_covariances = jnp.stack(
+        local_epistemic_covariances,
+        axis=1,
+    )
+
+    global_state_jacobian = assemble_block_diagonal_matrices(
+        local_state_jacobians
+    )
+
+    global_process_covariance = assemble_block_diagonal_matrices(
+        local_process_covariances
+    )
+
+    predicted_covariance = (
+        global_state_jacobian
+        @ belief.covariance
+        @ jnp.swapaxes(global_state_jacobian, -1, -2)
+        + global_process_covariance
+    )
+
+    predicted_covariance = symmetrize_covariance(
+        predicted_covariance
+    )
+
+    predicted_belief = GlobalBelief(
+        mean=predicted_mean,
+        covariance=predicted_covariance,
+    )
+
+    prediction_info = {
+        "global_state_jacobian": global_state_jacobian,
+        "global_process_covariance": global_process_covariance,
+        "local_state_jacobians": local_state_jacobians,
+        "local_process_covariances": local_process_covariances,
+        "local_aleatoric_covariances": local_aleatoric_covariances,
+        "local_epistemic_covariances": local_epistemic_covariances,
+    }
+
+    return predicted_belief, prediction_info

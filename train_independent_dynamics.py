@@ -29,6 +29,10 @@ from aorpo.estimator.uncertainty import (
     propagate_local_covariance,
 )
 
+from aorpo.estimator.online_oracle import (
+    run_online_oracle_global_belief_evaluation,
+)
+
 from aorpo.envs.jaxmarl_simple_spread_v3_env_wrapper import (
     env_step,
     make_mpe_env,
@@ -909,7 +913,14 @@ def main(cfg: DictConfig) -> None:
             standardizers=local_standardizers,
             metadata=checkpoint_metadata,
         )
-        
+
+    if bool(cfg.online_estimator.enabled):
+        run_online_oracle_global_belief_evaluation(
+            model_states=model_states,
+            standardizers=local_standardizers,
+            cfg=cfg,
+        )
+
     print("\nIndependent dynamics training finished.")
 
 

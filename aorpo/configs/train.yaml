@@ -76,3 +76,19 @@ independent_dynamics:
   
   checkpoint_path: checkpoints/independent_dynamics.pkl
   save_checkpoint: true
+
+online_estimator:
+  enabled: false
+
+  ego_agent_id: 0
+  num_episodes: 3
+  max_steps_per_episode: 25
+
+  communication_mode: initial_sync_only
+  periodic_interval: 5
+
+  initial_variance: 1.0e-8
+  measurement_variance: 1.0e-8
+
+  action_min: -1.0
+  action_max: 1.0
