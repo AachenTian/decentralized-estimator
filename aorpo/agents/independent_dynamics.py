@@ -1,7 +1,7 @@
 # aorpo/agents/independent_dynamics.py
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Any
+from typing import Dict, List, Optional, Sequence, Tuple, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +14,13 @@ from flax.training.train_state import TrainState
 
 LOCAL_STATE_DIM = 4  # [p_x, p_y, v_x, v_y]
 
+class LocalEnsembleGaussianPrediction(NamedTuple):
+    """
+    Raw ensemble Gaussian next-state predictions in original coordinates.
+    """
+
+    ensemble_next_means: jnp.ndarray
+    ensemble_next_covariances: jnp.ndarray
 
 # ============================================================
 # 1. Extract local transitions from the existing global replay batch
@@ -676,6 +683,155 @@ def predict_local_next(
     }
 
     return next_local_state, prediction_info
+
+def predict_local_ensemble_next_gaussians(
+    train_state,
+    standardizer,
+    local_state: jnp.ndarray,
+    local_action: jnp.ndarray,
+    min_logvar: float = -10.0,
+    max_logvar: float = 2.0,
+) -> LocalEnsembleGaussianPrediction:
+    """
+    Predict per-ensemble next-state Gaussian distributions.
+
+    Args:
+        train_state:
+            TrainState containing the ensemble dynamics parameters.
+
+        standardizer:
+            Local dynamics standardizer.
+
+        local_state:
+            Local physical state with shape (B, 4).
+
+        local_action:
+            Local action with shape (B, A).
+
+        min_logvar:
+            Lower clamp for normalized log variance.
+
+        max_logvar:
+            Upper clamp for normalized log variance.
+
+    Returns:
+        LocalEnsembleGaussianPrediction:
+            ensemble_next_means:
+                Shape (B, E, 4), in original state coordinates.
+
+            ensemble_next_covariances:
+                Shape (B, E, 4, 4), in original state coordinates.
+    """
+    if local_state.ndim != 2:
+        raise ValueError(
+            "local_state must have shape (B, LOCAL_STATE_DIM), "
+            f"got {local_state.shape}."
+        )
+
+    if local_action.ndim != 2:
+        raise ValueError(
+            "local_action must have shape (B, action_dim), "
+            f"got {local_action.shape}."
+        )
+
+    if local_state.shape[-1] != LOCAL_STATE_DIM:
+        raise ValueError(
+            "local_state last dimension must be LOCAL_STATE_DIM, "
+            f"got {local_state.shape[-1]}."
+        )
+
+    state_norm = standardizer.norm_local_state(local_state)
+    action_norm = standardizer.norm_action(local_action)
+
+    model_input = jnp.concatenate(
+        [state_norm, action_norm],
+        axis=-1,
+    )
+
+    ensemble_delta_mu_norm, ensemble_delta_logvar_norm = (
+        train_state.apply_fn(
+            {"params": train_state.params},
+            model_input,
+        )
+    )
+
+    ensemble_delta_logvar_norm = jnp.clip(
+        ensemble_delta_logvar_norm,
+        min_logvar,
+        max_logvar,
+    )
+
+    # The existing model code uses ensemble-first tensors:
+    #   ensemble_delta_mu_norm:     (E, B, D)
+    #   ensemble_delta_logvar_norm: (E, B, D)
+    #
+    # Convert them to batch-first tensors:
+    #   (B, E, D)
+    if ensemble_delta_mu_norm.shape[0] == local_state.shape[0]:
+        ensemble_delta_mu_norm_bed = ensemble_delta_mu_norm
+        ensemble_delta_logvar_norm_bed = ensemble_delta_logvar_norm
+    else:
+        ensemble_delta_mu_norm_bed = jnp.swapaxes(
+            ensemble_delta_mu_norm,
+            0,
+            1,
+        )
+        ensemble_delta_logvar_norm_bed = jnp.swapaxes(
+            ensemble_delta_logvar_norm,
+            0,
+            1,
+        )
+
+    # Denormalize ensemble delta means into original state coordinates.
+    #
+    # standardizer.denorm_delta(...) is affine, so it can be applied directly
+    # to tensors with shape (B, E, D).
+    ensemble_delta_means = standardizer.denorm_delta(
+        ensemble_delta_mu_norm_bed
+    )
+
+    # Recover the delta standard deviation implied by denorm_delta.
+    #
+    # If denorm_delta(x) = x * delta_std + delta_mean, then:
+    #   delta_std = denorm_delta(ones) - denorm_delta(zeros)
+    #
+    # This avoids depending on private field names.
+    zeros_norm = jnp.zeros(
+        (1, LOCAL_STATE_DIM),
+        dtype=local_state.dtype,
+    )
+    ones_norm = jnp.ones(
+        (1, LOCAL_STATE_DIM),
+        dtype=local_state.dtype,
+    )
+
+    delta_std = (
+        standardizer.denorm_delta(ones_norm)
+        - standardizer.denorm_delta(zeros_norm)
+    )[0]
+
+    ensemble_delta_variances = (
+        jnp.exp(ensemble_delta_logvar_norm_bed)
+        * (delta_std ** 2)
+    )
+
+    ensemble_next_means = (
+        local_state[:, None, :]
+        + ensemble_delta_means
+    )
+
+    ensemble_next_covariances = (
+        jnp.eye(
+            LOCAL_STATE_DIM,
+            dtype=local_state.dtype,
+        )[None, None, :, :]
+        * ensemble_delta_variances[:, :, :, None]
+    )
+
+    return LocalEnsembleGaussianPrediction(
+        ensemble_next_means=ensemble_next_means,
+        ensemble_next_covariances=ensemble_next_covariances,
+    )
 
 def predict_local_mean(
     train_state: TrainState,

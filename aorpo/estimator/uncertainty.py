@@ -1,7 +1,7 @@
 # aorpo/estimator/uncertainty.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -10,8 +10,12 @@ from flax.training.train_state import TrainState
 from aorpo.agents.independent_dynamics import (
     LocalStandardizerRS,
     predict_local_mean,
+    predict_local_ensemble_next_gaussians,
 )
 
+from aorpo.estimator.infoprop import (
+    infoprop_ensemble_prediction,
+)
 
 def covariance_trace_per_dim(covariance: jnp.ndarray) -> jnp.ndarray:
     """
@@ -169,6 +173,119 @@ def predict_local_mean_and_process_covariance(
     )
 
     return next_local_state, covariance_info["total_cov"], covariance_info
+
+class LocalInfopropDynamicsPrediction(NamedTuple):
+    """
+    Infoprop-style local dynamics prediction in original coordinates.
+
+    next_mean:
+        CI-fused estimated environment mean, shape (B, D).
+
+    process_covariance:
+        Process covariance used for belief prediction, shape (B, D, D).
+
+    ci_fused_covariance:
+        CI-fused aleatoric covariance, shape (B, D, D).
+
+    epistemic_covariance:
+        Ensemble mean-spread covariance, shape (B, D, D).
+
+    information_loss_covariance:
+        Infoprop posterior covariance, shape (B, D, D).
+        This is useful as an information-loss diagnostic, but it should not
+        be directly used as the process covariance in the Kalman belief
+        prediction.
+    """
+
+    next_mean: jnp.ndarray
+    process_covariance: jnp.ndarray
+    ci_fused_covariance: jnp.ndarray
+    epistemic_covariance: jnp.ndarray
+    information_loss_covariance: jnp.ndarray
+
+
+def predict_local_infoprop_mean_and_process_covariance(
+    train_state,
+    standardizer,
+    local_state: jnp.ndarray,
+    local_action: jnp.ndarray,
+    jitter: float = 1.0e-6,
+    epistemic_process_scale: float = 0.0,
+) -> LocalInfopropDynamicsPrediction:
+    """
+    Predict local next-state mean and covariance using Infoprop-style
+    ensemble fusion.
+
+    Args:
+        train_state:
+            TrainState containing the local ensemble dynamics model.
+
+        standardizer:
+            Local dynamics standardizer.
+
+        local_state:
+            Local physical state with shape (B, 4).
+
+        local_action:
+            Local action with shape (B, A).
+
+        jitter:
+            Numerical stabilization for covariance inverses.
+
+        epistemic_process_scale:
+            Optional scale for adding epistemic covariance back into the
+            process covariance. The default 0.0 follows the Infoprop idea of
+            removing epistemic sampling noise from the propagated environment
+            distribution.
+
+    Returns:
+        LocalInfopropDynamicsPrediction.
+    """
+    if epistemic_process_scale < 0.0:
+        raise ValueError(
+            "epistemic_process_scale must be non-negative, "
+            f"got {epistemic_process_scale}."
+        )
+
+    raw_prediction = predict_local_ensemble_next_gaussians(
+        train_state=train_state,
+        standardizer=standardizer,
+        local_state=local_state,
+        local_action=local_action,
+    )
+
+    infoprop_prediction = infoprop_ensemble_prediction(
+        ensemble_means=raw_prediction.ensemble_next_means,
+        ensemble_covariances=(
+            raw_prediction.ensemble_next_covariances
+        ),
+        model_sample=None,
+        jitter=jitter,
+    )
+
+    process_covariance = (
+        infoprop_prediction.fused_covariance
+        + epistemic_process_scale
+        * infoprop_prediction.epistemic_covariance
+    )
+
+    process_covariance = symmetrize_covariance(
+        process_covariance
+    )
+
+    return LocalInfopropDynamicsPrediction(
+        next_mean=infoprop_prediction.fused_mean,
+        process_covariance=process_covariance,
+        ci_fused_covariance=(
+            infoprop_prediction.fused_covariance
+        ),
+        epistemic_covariance=(
+            infoprop_prediction.epistemic_covariance
+        ),
+        information_loss_covariance=(
+            infoprop_prediction.posterior_covariance
+        ),
+    )
 
 
 def compute_local_state_jacobian(

@@ -1,6 +1,11 @@
 # aorpo/estimator/online_oracle.py
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
+from hydra.utils import to_absolute_path
+
 from typing import Any, Dict, Sequence
 
 import jax
@@ -17,6 +22,7 @@ from aorpo.estimator.global_belief import (
     extract_agent_state,
     initialize_global_belief,
     make_isotropic_covariance,
+    predict_global_belief_infoprop_oracle_actions,
     predict_global_belief_oracle_actions,
 )
 from aorpo.estimator.uncertainty import covariance_trace_per_dim
@@ -176,6 +182,121 @@ def mean_or_nan(values: list[float]) -> float:
 
     return float(jnp.mean(jnp.asarray(values)))
 
+def belief_local_state_means(
+    belief: GlobalBelief,
+    num_agents: int,
+    local_state_dim: int,
+) -> jnp.ndarray:
+    """
+    Reshape a global belief mean into per-agent local state means.
+
+    Returns:
+        Array with shape (B, N, D).
+    """
+    return belief.mean.reshape(
+        belief.mean.shape[0],
+        num_agents,
+        local_state_dim,
+    )
+
+
+def all_agent_covariance_proxies(
+    belief: GlobalBelief,
+    num_agents: int,
+    local_state_dim: int,
+) -> jnp.ndarray:
+    """
+    Compute trace(P_jj) / D for every agent covariance block.
+
+    Returns:
+        Array with shape (N,).
+    """
+    scores = []
+
+    for agent_id in range(num_agents):
+        local_covariance = extract_agent_covariance(
+            belief=belief,
+            agent_id=agent_id,
+            num_agents=num_agents,
+            local_state_dim=local_state_dim,
+        )
+
+        scores.append(
+            covariance_trace_per_dim(local_covariance)[0]
+        )
+
+    return jnp.stack(scores, axis=0)
+
+
+def all_agent_state_mse(
+    belief: GlobalBelief,
+    true_local_states: jnp.ndarray,
+    num_agents: int,
+    local_state_dim: int,
+) -> jnp.ndarray:
+    """
+    Compute one per-agent physical-state MSE.
+
+    Args:
+        belief:
+            Full global belief with batch size one.
+
+        true_local_states:
+            True local physical states with shape (N, D).
+
+    Returns:
+        Per-agent MSE with shape (N,).
+    """
+    estimated_local_states = belief_local_state_means(
+        belief=belief,
+        num_agents=num_agents,
+        local_state_dim=local_state_dim,
+    )[0]
+
+    return jnp.mean(
+        (estimated_local_states - true_local_states) ** 2,
+        axis=-1,
+    )
+
+
+def build_trace_path(
+    trace_directory: str,
+    communication_mode: str,
+    periodic_interval: int,
+    event_trigger_threshold: float,
+    ego_agent_id: int,
+    episode_index: int,
+) -> Path:
+    """
+    Construct an output path for one saved online estimator trace.
+    """
+    output_directory = Path(
+        to_absolute_path(trace_directory)
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if communication_mode == "periodic":
+        mode_tag = f"periodic_k{periodic_interval}"
+    elif communication_mode == "event_triggered":
+        threshold_tag = (
+            f"{event_trigger_threshold:.4f}"
+            .replace(".", "p")
+        )
+        mode_tag = f"event_tau{threshold_tag}"
+    else:
+        mode_tag = communication_mode
+
+    filename = (
+        f"{mode_tag}_ego{ego_agent_id}_"
+        f"episode{episode_index + 1:03d}.npz"
+    )
+
+    return output_directory / filename
+
 
 def run_online_oracle_global_belief_evaluation(
     model_states: Sequence[TrainState],
@@ -207,6 +328,14 @@ def run_online_oracle_global_belief_evaluation(
         cfg.online_estimator.communication_mode
     )
 
+    dynamics_prediction_mode = str(
+        cfg.online_estimator.dynamics_prediction_mode
+    )
+
+    epistemic_process_scale = float(
+        cfg.online_estimator.epistemic_process_scale
+    )
+
     periodic_interval = int(
         cfg.online_estimator.periodic_interval
     )
@@ -225,6 +354,18 @@ def run_online_oracle_global_belief_evaluation(
 
     action_min = float(cfg.online_estimator.action_min)
     action_max = float(cfg.online_estimator.action_max)
+
+    trace_enabled = bool(
+        cfg.online_estimator.trace_enabled
+    )
+
+    trace_episode_index = int(
+        cfg.online_estimator.trace_episode_index
+    )
+
+    trace_directory = str(
+        cfg.online_estimator.trace_directory
+    )
 
     if not 0 <= ego_agent_id < num_agents:
         raise ValueError(
@@ -253,6 +394,31 @@ def run_online_oracle_global_belief_evaluation(
         raise ValueError(
             "event_trigger_threshold must be non-negative, "
             f"got {event_trigger_threshold}."
+        )
+
+    if trace_enabled and not 0 <= trace_episode_index < num_episodes:
+        raise ValueError(
+            "trace_episode_index must refer to an episode in the evaluation. "
+            f"Received {trace_episode_index} with "
+            f"num_episodes={num_episodes}."
+        )
+
+    valid_dynamics_prediction_modes = {
+        "standard",
+        "infoprop_ci",
+    }
+
+    if dynamics_prediction_mode not in valid_dynamics_prediction_modes:
+        raise ValueError(
+            "Unsupported dynamics_prediction_mode: "
+            f"{dynamics_prediction_mode}. "
+            f"Expected one of {sorted(valid_dynamics_prediction_modes)}."
+        )
+
+    if epistemic_process_scale < 0.0:
+        raise ValueError(
+            "epistemic_process_scale must be non-negative, "
+            f"got {epistemic_process_scale}."
         )
 
     env = make_mpe_env(cfg)
@@ -290,6 +456,20 @@ def run_online_oracle_global_belief_evaluation(
     print(f"Communication mode: {communication_mode}")
     print(f"Number of episodes: {num_episodes}")
 
+    print(f"Dynamics prediction mode: {dynamics_prediction_mode}")
+
+    if dynamics_prediction_mode == "infoprop_ci":
+        print(
+            "Epistemic process scale: "
+            f"{epistemic_process_scale:.6f}"
+        )
+
+    if trace_enabled:
+        print(
+            "Trace logging enabled for episode index: "
+            f"{trace_episode_index}"
+        )
+
     if communication_mode == "event_triggered":
         print(
             "Event trigger threshold "
@@ -312,6 +492,47 @@ def run_online_oracle_global_belief_evaluation(
             initial_variance=initial_variance,
         )
 
+        trace_this_episode = (
+            trace_enabled
+            and episode_index == trace_episode_index
+        )
+
+        if trace_this_episode:
+            trace_steps = {
+                "true_local_states": [],
+                "landmark_positions": [],
+                "joint_actions": [],
+                "predicted_local_means": [],
+                "after_ego_local_means": [],
+                "posterior_local_means": [],
+                "predicted_global_covariances": [],
+                "after_ego_global_covariances": [],
+                "posterior_global_covariances": [],
+                "predicted_covariance_proxy": [],
+                "after_ego_covariance_proxy": [],
+                "posterior_covariance_proxy": [],
+                "predicted_state_mse": [],
+                "after_ego_state_mse": [],
+                "posterior_state_mse": [],
+                "communication_decisions": [],
+            }
+
+            trace_initial_local_states = np.asarray(
+                initial_local_states
+            )
+
+            trace_initial_mean = np.asarray(
+                belief.mean[0]
+            )
+
+            trace_initial_covariance = np.asarray(
+                belief.covariance[0]
+            )
+
+            trace_initial_landmark_positions = np.asarray(
+                env_state.p_pos[num_agents:]
+            )
+
         episode_message_count = 0
         episode_post_update_mse_values: list[float] = []
 
@@ -329,8 +550,8 @@ def run_online_oracle_global_belief_evaluation(
                 dtype=jnp.float32,
             )
 
-            predicted_belief, _ = (
-                predict_global_belief_oracle_actions(
+            if dynamics_prediction_mode == "standard":
+                predicted_belief, _ = predict_global_belief_oracle_actions(
                     belief=belief,
                     model_states=model_states,
                     standardizers=standardizers,
@@ -338,7 +559,21 @@ def run_online_oracle_global_belief_evaluation(
                     num_agents=num_agents,
                     local_state_dim=local_state_dim,
                 )
-            )
+            elif dynamics_prediction_mode == "infoprop_ci":
+                predicted_belief = predict_global_belief_infoprop_oracle_actions(
+                    belief=belief,
+                    model_states=model_states,
+                    standardizers=standardizers,
+                    joint_actions=joint_actions[None, ...],
+                    num_agents=num_agents,
+                    local_state_dim=local_state_dim,
+                    epistemic_process_scale=epistemic_process_scale,
+                )
+            else:
+                raise RuntimeError(
+                    "Unexpected dynamics_prediction_mode after validation: "
+                    f"{dynamics_prediction_mode}."
+                )
 
             action_dict = build_action_dict(
                 env=env,
@@ -364,7 +599,7 @@ def run_online_oracle_global_belief_evaluation(
                 dtype=true_next_local_states.dtype,
             )
 
-            belief, _ = direct_agent_observation_update(
+            belief_after_ego, _ = direct_agent_observation_update(
                 predicted_belief=predicted_belief,
                 observed_agent_id=ego_agent_id,
                 measurement=true_next_local_states[
@@ -375,7 +610,8 @@ def run_online_oracle_global_belief_evaluation(
                 local_state_dim=local_state_dim,
             )
 
-            pre_communication_belief = belief
+            pre_communication_belief = belief_after_ego
+            belief = belief_after_ego
 
             for remote_agent_id in remote_agent_ids:
                 estimated_remote_state = extract_agent_state(
@@ -481,11 +717,194 @@ def run_online_oracle_global_belief_evaluation(
                     float(remote_mse)
                 )
 
+            if trace_this_episode:
+                communication_mask = np.zeros(
+                    (num_agents,),
+                    dtype=np.bool_,
+                )
+
+                for remote_agent_id in remote_agent_ids:
+                    communication_mask[remote_agent_id] = (
+                        communication_decisions[remote_agent_id]
+                    )
+
+                trace_steps["true_local_states"].append(
+                    np.asarray(true_next_local_states)
+                )
+
+                trace_steps["landmark_positions"].append(
+                    np.asarray(
+                        next_env_state.p_pos[num_agents:]
+                    )
+                )
+
+                trace_steps["joint_actions"].append(
+                    np.asarray(joint_actions)
+                )
+
+                trace_steps["predicted_local_means"].append(
+                    np.asarray(
+                        belief_local_state_means(
+                            belief=predicted_belief,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )[0]
+                    )
+                )
+
+                trace_steps["after_ego_local_means"].append(
+                    np.asarray(
+                        belief_local_state_means(
+                            belief=belief_after_ego,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )[0]
+                    )
+                )
+
+                trace_steps["posterior_local_means"].append(
+                    np.asarray(
+                        belief_local_state_means(
+                            belief=belief,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )[0]
+                    )
+                )
+
+                trace_steps["predicted_global_covariances"].append(
+                    np.asarray(predicted_belief.covariance[0])
+                )
+
+                trace_steps["after_ego_global_covariances"].append(
+                    np.asarray(belief_after_ego.covariance[0])
+                )
+
+                trace_steps["posterior_global_covariances"].append(
+                    np.asarray(belief.covariance[0])
+                )
+
+                trace_steps["predicted_covariance_proxy"].append(
+                    np.asarray(
+                        all_agent_covariance_proxies(
+                            belief=predicted_belief,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )
+                    )
+                )
+
+                trace_steps["after_ego_covariance_proxy"].append(
+                    np.asarray(
+                        all_agent_covariance_proxies(
+                            belief=belief_after_ego,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )
+                    )
+                )
+
+                trace_steps["posterior_covariance_proxy"].append(
+                    np.asarray(
+                        all_agent_covariance_proxies(
+                            belief=belief,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )
+                    )
+                )
+
+                trace_steps["predicted_state_mse"].append(
+                    np.asarray(
+                        all_agent_state_mse(
+                            belief=predicted_belief,
+                            true_local_states=true_next_local_states,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )
+                    )
+                )
+
+                trace_steps["after_ego_state_mse"].append(
+                    np.asarray(
+                        all_agent_state_mse(
+                            belief=belief_after_ego,
+                            true_local_states=true_next_local_states,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )
+                    )
+                )
+
+                trace_steps["posterior_state_mse"].append(
+                    np.asarray(
+                        all_agent_state_mse(
+                            belief=belief,
+                            true_local_states=true_next_local_states,
+                            num_agents=num_agents,
+                            local_state_dim=local_state_dim,
+                        )
+                    )
+                )
+
+                trace_steps["communication_decisions"].append(
+                    communication_mask
+                )
             total_environment_steps += 1
             env_state = next_env_state
 
             if bool(dones["__all__"]):
                 break
+
+        if trace_this_episode:
+            trace_path = build_trace_path(
+                trace_directory=trace_directory,
+                communication_mode=communication_mode,
+                periodic_interval=periodic_interval,
+                event_trigger_threshold=event_trigger_threshold,
+                ego_agent_id=ego_agent_id,
+                episode_index=episode_index,
+            )
+
+            trace_payload = {
+                key: np.stack(values, axis=0)
+                for key, values in trace_steps.items()
+            }
+
+            trace_payload.update(
+                {
+                    "time_indices": np.arange(
+                        1,
+                        len(trace_steps["true_local_states"]) + 1,
+                        dtype=np.int32,
+                    ),
+                    "initial_true_local_states": trace_initial_local_states,
+                    "initial_mean": trace_initial_mean,
+                    "initial_covariance": trace_initial_covariance,
+                    "initial_landmark_positions": (
+                        trace_initial_landmark_positions
+                    ),
+                    "ego_agent_id": np.int32(ego_agent_id),
+                    "num_agents": np.int32(num_agents),
+                    "local_state_dim": np.int32(local_state_dim),
+                    "event_trigger_threshold": np.float32(
+                        event_trigger_threshold
+                    ),
+                    "periodic_interval": np.int32(
+                        periodic_interval
+                    ),
+                    "communication_mode": np.asarray(
+                        communication_mode
+                    ),
+                }
+            )
+
+            np.savez_compressed(
+                trace_path,
+                **trace_payload,
+            )
+
+            print(f"Saved episode trace to: {trace_path}")
 
         print(
             f"Episode {episode_index + 1:02d} | "
@@ -507,6 +926,8 @@ def run_online_oracle_global_belief_evaluation(
 
     metrics = {
         "communication_mode": communication_mode,
+        "dynamics_prediction_mode": dynamics_prediction_mode,
+        "epistemic_process_scale": epistemic_process_scale,
         "ego_agent_id": ego_agent_id,
         "event_trigger_threshold": event_trigger_threshold,
         "total_environment_steps": total_environment_steps,

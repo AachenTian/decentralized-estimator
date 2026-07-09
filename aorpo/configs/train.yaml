@@ -6,6 +6,7 @@ env:
   obs_dim: 18
   act_dim: 5
   ENV_NAME: MPE_simple_spread_v3
+  u_noise: [1.0, 1.0, 1.0]
 
 replay:
   capacity: 50000
@@ -61,21 +62,23 @@ policy:
   alpha: 0.2
 
 independent_dynamics:
-  train_data_steps: 10000
-  eval_data_steps: 2000
-  gradient_steps: 1000
+  train_data_steps: 50000
+  eval_data_steps: 10000
+  gradient_steps: 5000
   batch_size: 1024
-  eval_interval: 100
+  eval_interval: 250
+
   rollout_horizon: 20
   rollout_num_starts: 100
 
   initial_measurement_variance: 1.0e-8
-
   include_action_uncertainty: false
   manual_action_variance: 0.0
   
-  checkpoint_path: checkpoints/independent_dynamics.pkl
+  checkpoint_path: checkpoints/independent_dynamics_unoise1_50k_5k.pkl
   save_checkpoint: true
+
+
 
 online_estimator:
   enabled: false
@@ -88,8 +91,15 @@ online_estimator:
   periodic_interval: 5
   event_trigger_threshold: 0.20
 
+  dynamics_prediction_mode: standard
+  epistemic_process_scale: 0.0
+
   initial_variance: 1.0e-8
   measurement_variance: 1.0e-8
 
   action_min: -1.0
   action_max: 1.0
+
+  trace_enabled: false
+  trace_episode_index: 0
+  trace_directory: results/traces
