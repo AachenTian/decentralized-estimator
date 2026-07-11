@@ -248,3 +248,6 @@ runs/
 
 # Generated animations
 *.gif
+
+# Generated dynamics datasets
+datasets/*.npz
