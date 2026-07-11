@@ -7,8 +7,19 @@ from omegaconf import DictConfig
 from aorpo.visualiztion.make_animation import animate_episode
 
 def make_mpe_env(cfg: DictConfig):
-    env = make(cfg.env.ENV_NAME, action_type="Continuous", u_noise=jnp.array([1.00, 1.00, 1.00]),)    #"MPE_simple_v3"
-    return env
+    """
+    Create the stochastic MPE environment configured for this experiment.
+    """
+    control_noise = jnp.asarray(
+        cfg.env.u_noise,
+        dtype=jnp.float32,
+    )
+
+    return make(
+        cfg.env.ENV_NAME,
+        action_type="Continuous",
+        u_noise=control_noise,
+    )
 
 def env_reset(env, key):
     key_reset = jax.random.PRNGKey(40)

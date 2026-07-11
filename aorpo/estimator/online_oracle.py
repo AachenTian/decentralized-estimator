@@ -28,6 +28,7 @@ from aorpo.estimator.global_belief import (
 from aorpo.estimator.uncertainty import covariance_trace_per_dim
 
 from aorpo.estimator.trigger import (
+    position_radius_threshold_trigger,
     trace_threshold_trigger,
 )
 
@@ -117,6 +118,8 @@ def decide_remote_communications(
     step_index: int,
     periodic_interval: int,
     event_trigger_threshold: float,
+    position_trigger_radius: float,
+    position_trigger_scale: float,
     num_agents: int,
     local_state_dim: int,
 ) -> Dict[int, bool]:
@@ -165,11 +168,32 @@ def decide_remote_communications(
 
         return decisions
 
+    if communication_mode == "position_event_triggered":
+        decisions: Dict[int, bool] = {}
+
+        for remote_agent_id in remote_agent_ids:
+            remote_covariance = extract_agent_covariance(
+                belief=belief_before_remote_messages,
+                agent_id=remote_agent_id,
+                num_agents=num_agents,
+                local_state_dim=local_state_dim,
+            )
+
+            decisions[remote_agent_id] = bool(
+                position_radius_threshold_trigger(
+                    covariance=remote_covariance,
+                    radius_threshold=position_trigger_radius,
+                    scale=position_trigger_scale,
+                )[0]
+            )
+
+        return decisions
+
     raise ValueError(
         "Unsupported communication_mode: "
         f"{communication_mode}. "
         "Expected one of: initial_sync_only, always_communicate, "
-        "periodic, event_triggered."
+        "periodic, event_triggered, position_event_triggered."
     )
 
 
@@ -262,6 +286,8 @@ def all_agent_state_mse(
 def build_trace_path(
     trace_directory: str,
     communication_mode: str,
+    position_trigger_radius: float,
+    position_trigger_scale: float,
     periodic_interval: int,
     event_trigger_threshold: float,
     ego_agent_id: int,
@@ -287,6 +313,16 @@ def build_trace_path(
             .replace(".", "p")
         )
         mode_tag = f"event_tau{threshold_tag}"
+    elif communication_mode == "position_event_triggered":
+        radius_tag = (
+            f"{position_trigger_radius:.4f}"
+            .replace(".", "p")
+        )
+        scale_tag = (
+            f"{position_trigger_scale:.1f}"
+            .replace(".", "p")
+        )
+        mode_tag = f"pos_event_r{radius_tag}_s{scale_tag}"
     else:
         mode_tag = communication_mode
 
@@ -344,6 +380,14 @@ def run_online_oracle_global_belief_evaluation(
         cfg.online_estimator.event_trigger_threshold
     )
 
+    position_trigger_radius = float(
+        cfg.online_estimator.position_trigger_radius
+    )
+
+    position_trigger_scale = float(
+        cfg.online_estimator.position_trigger_scale
+    )
+
     initial_variance = float(
         cfg.online_estimator.initial_variance
     )
@@ -394,6 +438,18 @@ def run_online_oracle_global_belief_evaluation(
         raise ValueError(
             "event_trigger_threshold must be non-negative, "
             f"got {event_trigger_threshold}."
+        )
+
+    if position_trigger_radius < 0.0:
+        raise ValueError(
+            "position_trigger_radius must be non-negative, "
+            f"got {position_trigger_radius}."
+        )
+
+    if position_trigger_scale <= 0.0:
+        raise ValueError(
+            "position_trigger_scale must be positive, "
+            f"got {position_trigger_scale}."
         )
 
     if trace_enabled and not 0 <= trace_episode_index < num_episodes:
@@ -475,6 +531,13 @@ def run_online_oracle_global_belief_evaluation(
             "Event trigger threshold "
             f"(trace(P_jj) / local_state_dim): "
             f"{event_trigger_threshold:.6f}"
+        )
+
+    if communication_mode == "position_event_triggered":
+        print(
+            "Position trigger radius "
+            f"({position_trigger_scale:.1f} sigma): "
+            f"{position_trigger_radius:.6f}"
         )
 
     for episode_index in range(num_episodes):
@@ -655,6 +718,8 @@ def run_online_oracle_global_belief_evaluation(
                 step_index=step_index,
                 periodic_interval=periodic_interval,
                 event_trigger_threshold=event_trigger_threshold,
+                position_trigger_radius=position_trigger_radius,
+                position_trigger_scale=position_trigger_scale,
                 num_agents=num_agents,
                 local_state_dim=local_state_dim,
             )
@@ -860,6 +925,8 @@ def run_online_oracle_global_belief_evaluation(
             trace_path = build_trace_path(
                 trace_directory=trace_directory,
                 communication_mode=communication_mode,
+                position_trigger_radius=position_trigger_radius,
+                position_trigger_scale=position_trigger_scale,
                 periodic_interval=periodic_interval,
                 event_trigger_threshold=event_trigger_threshold,
                 ego_agent_id=ego_agent_id,
@@ -930,6 +997,8 @@ def run_online_oracle_global_belief_evaluation(
         "epistemic_process_scale": epistemic_process_scale,
         "ego_agent_id": ego_agent_id,
         "event_trigger_threshold": event_trigger_threshold,
+        "position_trigger_radius": position_trigger_radius,
+        "position_trigger_scale": position_trigger_scale,
         "total_environment_steps": total_environment_steps,
         "total_remote_messages": total_remote_messages,
         "remote_message_counts": remote_message_counts,

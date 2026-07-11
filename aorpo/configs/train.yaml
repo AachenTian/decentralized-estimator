@@ -91,6 +91,9 @@ online_estimator:
   periodic_interval: 5
   event_trigger_threshold: 0.20
 
+  position_trigger_radius: 0.55
+  position_trigger_scale: 2.0
+
   dynamics_prediction_mode: standard
   epistemic_process_scale: 0.0
 
