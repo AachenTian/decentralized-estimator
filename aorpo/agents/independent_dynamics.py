@@ -12,7 +12,8 @@ from flax import struct
 from flax.training.train_state import TrainState
 
 
-LOCAL_STATE_DIM = 4  # [p_x, p_y, v_x, v_y]
+MPE_LOCAL_STATE_DIM = 4  # Legacy MPE state: [p_x, p_y, v_x, v_y]
+LOCAL_STATE_DIM = MPE_LOCAL_STATE_DIM  # Backward-compatible default
 
 class LocalEnsembleGaussianPrediction(NamedTuple):
     """
@@ -163,6 +164,51 @@ def make_local_transition_batch(
     }
 
 
+def make_direct_local_transition_batch(
+    local_state: jnp.ndarray,
+    local_action: jnp.ndarray,
+    next_local_state: jnp.ndarray,
+) -> Dict[str, jnp.ndarray]:
+    """Build a local transition batch without an MPE/global replay layout.
+
+    This is the preferred entry point for datasets that already store
+    per-agent transitions, such as the acceleration-controlled
+    differential-drive dataset.
+
+    Args:
+        local_state: (B, D)
+        local_action: (B, A)
+        next_local_state: (B, D)
+    """
+    local_state = jnp.asarray(local_state)
+    local_action = jnp.asarray(local_action)
+    next_local_state = jnp.asarray(next_local_state)
+
+    if local_state.ndim != 2 or next_local_state.ndim != 2:
+        raise ValueError(
+            "local_state and next_local_state must both have shape (B, D)."
+        )
+    if local_action.ndim != 2:
+        raise ValueError("local_action must have shape (B, A).")
+    if local_state.shape != next_local_state.shape:
+        raise ValueError(
+            "local_state and next_local_state must have identical shapes, "
+            f"got {local_state.shape} and {next_local_state.shape}."
+        )
+    if local_state.shape[0] != local_action.shape[0]:
+        raise ValueError(
+            "State and action batch sizes must match, got "
+            f"{local_state.shape[0]} and {local_action.shape[0]}."
+        )
+
+    return {
+        "local_state": local_state,
+        "local_action": local_action,
+        "next_local_state": next_local_state,
+        "delta": next_local_state - local_state,
+    }
+
+
 # ============================================================
 # 2. Per-agent running normalizer
 # ============================================================
@@ -238,11 +284,19 @@ class LocalStandardizerRS:
 def init_local_standardizers(
     num_agents: int,
     act_dim: int,
+    local_state_dim: int = LOCAL_STATE_DIM,
 ) -> List[LocalStandardizerRS]:
-    """Create one local normalizer per agent."""
+    """Create one local normalizer per agent.
+
+    Args:
+        num_agents: Number of independent local models.
+        act_dim: Per-agent action dimension.
+        local_state_dim: Per-agent state dimension. The legacy MPE default is
+            4; the acceleration-controlled differential-drive model uses 5.
+    """
     return [
         LocalStandardizerRS.create(
-            local_state_dim=LOCAL_STATE_DIM,
+            local_state_dim=local_state_dim,
             act_dim=act_dim,
         )
         for _ in range(num_agents)
@@ -310,7 +364,7 @@ class EnsembleIndependentDynamics(nn.Module):
     Ensemble of local Gaussian dynamics models.
 
     Input:
-        [p_x, p_y, v_x, v_y, a_i]
+        [local_state_i, local_action_i]
 
     Output per member:
         mean and log-variance of normalized delta z_i
@@ -343,8 +397,8 @@ class EnsembleIndependentDynamics(nn.Module):
             x: (B, local_state_dim + act_dim)
 
         Returns:
-            mu:     (E, B, 4)
-            logvar: (E, B, 4)
+            mu:     (E, B, local_state_dim)
+            logvar: (E, B, local_state_dim)
         """
         return self.members(x)
 
@@ -357,6 +411,7 @@ def init_independent_transition_model(
     rng: jax.Array,
     act_dim: int,
     cfg: Any,
+    local_state_dim: int = LOCAL_STATE_DIM,
 ) -> Tuple[EnsembleIndependentDynamics, TrainState]:
     """
     Initialize one agent's independent ensemble dynamics model.
@@ -364,13 +419,13 @@ def init_independent_transition_model(
     model = EnsembleIndependentDynamics(
         num_members=cfg.model_dynamics.num_members,
         hidden_dims=tuple(cfg.model_dynamics.hidden_dims),
-        out_dim=LOCAL_STATE_DIM,
+        out_dim=local_state_dim,
         min_logvar=cfg.model_dynamics.min_logvar,
         max_logvar=cfg.model_dynamics.max_logvar,
     )
 
     dummy_input = jnp.zeros(
-        (1, LOCAL_STATE_DIM + act_dim),
+        (1, local_state_dim + act_dim),
         dtype=jnp.float32,
     )
 
@@ -392,6 +447,7 @@ def init_independent_transition_models(
     num_agents: int,
     act_dim: int,
     cfg: Any,
+    local_state_dim: int = LOCAL_STATE_DIM,
 ) -> Tuple[EnsembleIndependentDynamics, List[TrainState]]:
     """
     Initialize one independent ensemble model per agent.
@@ -408,6 +464,7 @@ def init_independent_transition_models(
             rng=key,
             act_dim=act_dim,
             cfg=cfg,
+            local_state_dim=local_state_dim,
         )
         model = model_i
         train_states.append(state_i)
@@ -597,11 +654,11 @@ def predict_local_next(
     Predict one agent's next local physical state.
 
     Args:
-        local_state:  (B, 4)
+        local_state:  (B, local_state_dim)
         local_action: (B, act_dim)
 
     Returns:
-        next_local_state: (B, 4)
+        next_local_state: (B, local_state_dim)
         prediction_info: dictionary containing ensemble means and variances.
 
     Important:
@@ -614,7 +671,7 @@ def predict_local_next(
 
     if local_state.ndim != 2:
         raise ValueError(
-            "local_state must have shape (B, 4), "
+            "local_state must have shape (B, local_state_dim), "
             f"but got {local_state.shape}."
         )
 
@@ -703,7 +760,7 @@ def predict_local_ensemble_next_gaussians(
             Local dynamics standardizer.
 
         local_state:
-            Local physical state with shape (B, 4).
+            Local physical state with shape (B, local_state_dim).
 
         local_action:
             Local action with shape (B, A).
@@ -717,10 +774,10 @@ def predict_local_ensemble_next_gaussians(
     Returns:
         LocalEnsembleGaussianPrediction:
             ensemble_next_means:
-                Shape (B, E, 4), in original state coordinates.
+                Shape (B, E, local_state_dim), in original state coordinates.
 
             ensemble_next_covariances:
-                Shape (B, E, 4, 4), in original state coordinates.
+                Shape (B, E, local_state_dim, local_state_dim), in original state coordinates.
     """
     if local_state.ndim != 2:
         raise ValueError(
@@ -734,11 +791,7 @@ def predict_local_ensemble_next_gaussians(
             f"got {local_action.shape}."
         )
 
-    if local_state.shape[-1] != LOCAL_STATE_DIM:
-        raise ValueError(
-            "local_state last dimension must be LOCAL_STATE_DIM, "
-            f"got {local_state.shape[-1]}."
-        )
+    local_state_dim = int(local_state.shape[-1])
 
     state_norm = standardizer.norm_local_state(local_state)
     action_norm = standardizer.norm_action(local_action)
@@ -765,22 +818,21 @@ def predict_local_ensemble_next_gaussians(
     #   ensemble_delta_mu_norm:     (E, B, D)
     #   ensemble_delta_logvar_norm: (E, B, D)
     #
-    # Convert them to batch-first tensors:
-    #   (B, E, D)
-    if ensemble_delta_mu_norm.shape[0] == local_state.shape[0]:
-        ensemble_delta_mu_norm_bed = ensemble_delta_mu_norm
-        ensemble_delta_logvar_norm_bed = ensemble_delta_logvar_norm
-    else:
-        ensemble_delta_mu_norm_bed = jnp.swapaxes(
-            ensemble_delta_mu_norm,
-            0,
-            1,
-        )
-        ensemble_delta_logvar_norm_bed = jnp.swapaxes(
-            ensemble_delta_logvar_norm,
-            0,
-            1,
-        )
+    # Convert the model's guaranteed ensemble-first output to batch-first:
+    #   (E, B, D) -> (B, E, D)
+    #
+    # Do not infer layout by comparing E and B: that becomes ambiguous when
+    # ensemble_size == batch_size.
+    ensemble_delta_mu_norm_bed = jnp.swapaxes(
+        ensemble_delta_mu_norm,
+        0,
+        1,
+    )
+    ensemble_delta_logvar_norm_bed = jnp.swapaxes(
+        ensemble_delta_logvar_norm,
+        0,
+        1,
+    )
 
     # Denormalize ensemble delta means into original state coordinates.
     #
@@ -797,11 +849,11 @@ def predict_local_ensemble_next_gaussians(
     #
     # This avoids depending on private field names.
     zeros_norm = jnp.zeros(
-        (1, LOCAL_STATE_DIM),
+        (1, local_state_dim),
         dtype=local_state.dtype,
     )
     ones_norm = jnp.ones(
-        (1, LOCAL_STATE_DIM),
+        (1, local_state_dim),
         dtype=local_state.dtype,
     )
 
@@ -822,7 +874,7 @@ def predict_local_ensemble_next_gaussians(
 
     ensemble_next_covariances = (
         jnp.eye(
-            LOCAL_STATE_DIM,
+            local_state_dim,
             dtype=local_state.dtype,
         )[None, None, :, :]
         * ensemble_delta_variances[:, :, :, None]

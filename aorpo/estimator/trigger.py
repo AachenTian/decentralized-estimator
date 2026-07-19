@@ -134,3 +134,74 @@ def position_radius_threshold_trigger(
     )
 
     return radius > radius_threshold
+
+def position_mean_error_score(
+    predicted_local_mean: jnp.ndarray,
+    observed_local_state: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Compute sender-side position mean error.
+
+    Args:
+        predicted_local_mean:
+            Common predicted local mean with shape (..., 4).
+
+        observed_local_state:
+            Sender's private observed local state with shape (..., 4).
+
+    Returns:
+        Position error with shape (...,), in environment position units.
+    """
+    position_residual = (
+        observed_local_state[..., :2]
+        - predicted_local_mean[..., :2]
+    )
+
+    return jnp.linalg.norm(
+        position_residual,
+        axis=-1,
+    )
+
+
+def sender_position_trigger(
+    predicted_local_mean: jnp.ndarray,
+    observed_local_state: jnp.ndarray,
+    predicted_local_covariance: jnp.ndarray,
+    error_threshold: float,
+    covariance_radius_threshold: float,
+    covariance_scale: float = 2.0,
+) -> jnp.ndarray:
+    """
+    Sender-side trigger using position mean error and position covariance.
+
+    A sender broadcasts if either:
+        position mean error > error_threshold
+    or:
+        position uncertainty radius > covariance_radius_threshold.
+    """
+    if error_threshold < 0.0:
+        raise ValueError(
+            "error_threshold must be non-negative, "
+            f"got {error_threshold}."
+        )
+
+    if covariance_radius_threshold < 0.0:
+        raise ValueError(
+            "covariance_radius_threshold must be non-negative, "
+            f"got {covariance_radius_threshold}."
+        )
+
+    error_score = position_mean_error_score(
+        predicted_local_mean=predicted_local_mean,
+        observed_local_state=observed_local_state,
+    )
+
+    covariance_score = position_uncertainty_radius(
+        covariance=predicted_local_covariance,
+        scale=covariance_scale,
+    )
+
+    return (
+        (error_score > error_threshold)
+        | (covariance_score > covariance_radius_threshold)
+    )

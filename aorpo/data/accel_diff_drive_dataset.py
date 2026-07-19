@@ -1,6 +1,7 @@
 """Trajectory-level data collection for acceleration-controlled diff-drive."""
 
 from __future__ import annotations
+from tqdm import trange
 
 from pathlib import Path
 from typing import NamedTuple
@@ -51,7 +52,10 @@ def collect_piecewise_constant_trajectories(
     trajectory_actions = []
     key = rng
 
-    for _ in range(num_trajectories):
+    for _ in trange(
+            num_trajectories,
+            desc="Collecting trajectories",
+    ):
         key, reset_key = jax.random.split(key)
         state = env.reset(reset_key)
         states = [env.local_states(state)]

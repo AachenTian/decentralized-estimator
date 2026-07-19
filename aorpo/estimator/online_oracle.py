@@ -30,6 +30,8 @@ from aorpo.estimator.uncertainty import covariance_trace_per_dim
 from aorpo.estimator.trigger import (
     position_radius_threshold_trigger,
     trace_threshold_trigger,
+    position_mean_error_score,
+    sender_position_trigger,
 )
 
 def extract_true_local_physical_states(
@@ -195,6 +197,61 @@ def decide_remote_communications(
         "Expected one of: initial_sync_only, always_communicate, "
         "periodic, event_triggered, position_event_triggered."
     )
+
+def decide_sender_broadcasts(
+    predicted_common_belief: GlobalBelief,
+    true_local_states: jnp.ndarray,
+    sender_agent_ids: Sequence[int],
+    sender_error_threshold: float,
+    sender_covariance_radius_threshold: float,
+    sender_covariance_scale: float,
+    num_agents: int,
+    local_state_dim: int,
+) -> Dict[int, bool]:
+    """
+    Decide which agents broadcast their private local observations.
+
+    This is sender-triggered:
+        each agent checks the common belief block of itself against its
+        private observed local state.
+    """
+    decisions: Dict[int, bool] = {}
+
+    for sender_agent_id in sender_agent_ids:
+        predicted_local_mean = extract_agent_state(
+            belief=predicted_common_belief,
+            agent_id=sender_agent_id,
+            num_agents=num_agents,
+            local_state_dim=local_state_dim,
+        )
+
+        predicted_local_covariance = extract_agent_covariance(
+            belief=predicted_common_belief,
+            agent_id=sender_agent_id,
+            num_agents=num_agents,
+            local_state_dim=local_state_dim,
+        )
+
+        observed_local_state = true_local_states[
+            sender_agent_id
+        ][None, :]
+
+        should_broadcast = sender_position_trigger(
+            predicted_local_mean=predicted_local_mean,
+            observed_local_state=observed_local_state,
+            predicted_local_covariance=predicted_local_covariance,
+            error_threshold=sender_error_threshold,
+            covariance_radius_threshold=(
+                sender_covariance_radius_threshold
+            ),
+            covariance_scale=sender_covariance_scale,
+        )
+
+        decisions[sender_agent_id] = bool(
+            should_broadcast[0]
+        )
+
+    return decisions
 
 
 def mean_or_nan(values: list[float]) -> float:
@@ -411,6 +468,18 @@ def run_online_oracle_global_belief_evaluation(
         cfg.online_estimator.trace_directory
     )
 
+    sender_error_threshold = float(
+        cfg.online_estimator.sender_error_threshold
+    )
+
+    sender_covariance_radius_threshold = float(
+        cfg.online_estimator.sender_covariance_radius_threshold
+    )
+
+    sender_covariance_scale = float(
+        cfg.online_estimator.sender_covariance_scale
+    )
+
     if not 0 <= ego_agent_id < num_agents:
         raise ValueError(
             f"ego_agent_id must be in [0, {num_agents - 1}], "
@@ -477,6 +546,24 @@ def run_online_oracle_global_belief_evaluation(
             f"got {epistemic_process_scale}."
         )
 
+    if sender_error_threshold < 0.0:
+        raise ValueError(
+            "sender_error_threshold must be non-negative, "
+            f"got {sender_error_threshold}."
+        )
+
+    if sender_covariance_radius_threshold < 0.0:
+        raise ValueError(
+            "sender_covariance_radius_threshold must be non-negative, "
+            f"got {sender_covariance_radius_threshold}."
+        )
+
+    if sender_covariance_scale <= 0.0:
+        raise ValueError(
+            "sender_covariance_scale must be positive, "
+            f"got {sender_covariance_scale}."
+        )
+
     env = make_mpe_env(cfg)
 
     rng = jax.random.PRNGKey(
@@ -489,6 +576,18 @@ def run_online_oracle_global_belief_evaluation(
         if agent_id != ego_agent_id
     ]
 
+    sender_trigger_modes = {
+        "sender_position_triggered",
+    }
+
+    sender_agent_ids = list(range(num_agents))
+
+    communicating_agent_ids = (
+        sender_agent_ids
+        if communication_mode in sender_trigger_modes
+        else remote_agent_ids
+    )
+
     pre_update_remote_mse_values: list[float] = []
     post_update_remote_mse_values: list[float] = []
 
@@ -499,8 +598,8 @@ def run_online_oracle_global_belief_evaluation(
     total_environment_steps = 0
 
     remote_message_counts = {
-        remote_agent_id: 0
-        for remote_agent_id in remote_agent_ids
+        agent_id: 0
+        for agent_id in communicating_agent_ids
     }
 
     print(
@@ -538,6 +637,15 @@ def run_online_oracle_global_belief_evaluation(
             "Position trigger radius "
             f"({position_trigger_scale:.1f} sigma): "
             f"{position_trigger_radius:.6f}"
+        )
+
+    if communication_mode == "sender_position_triggered":
+        print(
+            "Sender position trigger: "
+            f"error_threshold={sender_error_threshold:.6f}, "
+            "covariance_radius_threshold="
+            f"{sender_covariance_radius_threshold:.6f}, "
+            f"scale={sender_covariance_scale:.1f}"
         )
 
     for episode_index in range(num_episodes):

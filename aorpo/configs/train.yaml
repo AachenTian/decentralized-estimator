@@ -106,3 +106,7 @@ online_estimator:
   trace_enabled: false
   trace_episode_index: 0
   trace_directory: results/traces
+
+  sender_error_threshold: 0.30
+  sender_covariance_radius_threshold: 0.55
+  sender_covariance_scale: 2.0
