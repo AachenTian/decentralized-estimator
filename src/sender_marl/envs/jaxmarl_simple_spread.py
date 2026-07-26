@@ -29,6 +29,7 @@ class SimpleSpreadConfig:
     action_mode: ActionMode = "force_2d"
     remote_feature_mode: RemoteFeatureMode = "relative_state"
     u_noise: float | tuple[float, ...] = 0.0
+    collision_distance: float = 0.30
 
     def __post_init__(self) -> None:
         if self.num_agents < 2:
@@ -37,6 +38,8 @@ class SimpleSpreadConfig:
             raise ValueError("num_landmarks must be positive.")
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive.")
+        if self.collision_distance <= 0.0:
+            raise ValueError("collision_distance must be positive.")
         if self.action_mode not in ("force_2d", "native"):
             raise ValueError(f"Unsupported action_mode={self.action_mode!r}.")
         if self.remote_feature_mode not in (
@@ -178,9 +181,13 @@ class JaxMARLSimpleSpreadAdapter:
             alive=jnp.logical_not(done_array).astype(jnp.float32)
         )
 
+        collision_metrics = self.compute_collision_metrics(
+            features.local_states
+        )
         metrics: Mapping[str, Array] = {
             "team_reward": jnp.sum(reward_array, axis=-1),
             "mean_reward": jnp.mean(reward_array, axis=-1),
+            **collision_metrics,
         }
         return EnvStep(
             env_state=next_state,
@@ -309,6 +316,71 @@ class JaxMARLSimpleSpreadAdapter:
             model_state=critic_state,
             alive=alive,
         )
+
+
+    def compute_collision_metrics(
+        self,
+        local_states: Array,
+    ) -> dict[str, Array]:
+        """Compute Simple-Spread collision diagnostics.
+
+        Collision geometry is intentionally kept inside this environment
+        adapter. Generic policy and training code only consumes the returned
+        metrics and does not assume that positions occupy particular state
+        coordinates.
+
+        Args:
+            local_states: (..., num_agents, local_state_dim). For this adapter,
+                the first two local-state entries are planar position.
+
+        Returns:
+            collision_count: Number of colliding unordered agent pairs.
+            pair_collision_rate: Fraction of all unordered pairs colliding.
+            any_collision: Whether at least one pair collides.
+            min_pair_distance: Minimum distance between two distinct agents.
+        """
+
+        states = jnp.asarray(local_states, dtype=jnp.float32)
+        expected_tail = (self.spec.num_agents, self.spec.local_state_dim)
+        if states.shape[-2:] != expected_tail:
+            raise ValueError(
+                "local_states must end with "
+                f"{expected_tail}, got shape={states.shape}."
+            )
+
+        positions = states[..., :, :2]
+        relative = positions[..., :, None, :] - positions[..., None, :, :]
+        distances = jnp.linalg.norm(relative, axis=-1)
+
+        n = self.spec.num_agents
+        upper_triangle = jnp.triu(
+            jnp.ones((n, n), dtype=jnp.bool_),
+            k=1,
+        )
+        colliding_pairs = (
+            distances < self.config.collision_distance
+        ) & upper_triangle
+
+        collision_count = jnp.sum(colliding_pairs, axis=(-2, -1))
+        num_pairs = n * (n - 1) // 2
+        pair_collision_rate = collision_count.astype(jnp.float32) / float(
+            num_pairs
+        )
+        any_collision = collision_count > 0
+
+        masked_distances = jnp.where(
+            upper_triangle,
+            distances,
+            jnp.inf,
+        )
+        min_pair_distance = jnp.min(masked_distances, axis=(-2, -1))
+
+        return {
+            "collision_count": collision_count,
+            "pair_collision_rate": pair_collision_rate,
+            "any_collision": any_collision,
+            "min_pair_distance": min_pair_distance,
+        }
 
     def _stack_agent_mapping(self, values: Mapping[str, Array]) -> Array:
         return jnp.stack([jnp.asarray(values[agent]) for agent in self.agents], axis=-1)
