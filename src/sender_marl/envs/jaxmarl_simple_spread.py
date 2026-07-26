@@ -412,8 +412,26 @@ class JaxMARLSimpleSpreadAdapter:
 
         n = self.spec.num_agents
         feature_dim = pairwise.shape[-1]
-        mask = ~jnp.eye(n, dtype=jnp.bool_)
-        selected = pairwise[..., mask, :]
+
+        # Boolean advanced indexing creates a data-dependent output size and is
+        # therefore invalid inside jax.jit. Build a fixed-size integer gather
+        # table instead. Row i contains every remote-agent index j != i.
+        all_indices = jnp.arange(n, dtype=jnp.int32)
+        remote_indices = jnp.stack(
+            [
+                jnp.concatenate(
+                    [all_indices[:i], all_indices[i + 1 :]],
+                    axis=0,
+                )
+                for i in range(n)
+            ],
+            axis=0,
+        )
+        ego_indices = all_indices[:, None]
+
+        # pairwise: (..., ego, remote, feature)
+        # selected: (..., ego, n - 1, feature)
+        selected = pairwise[..., ego_indices, remote_indices, :]
         return selected.reshape(*pairwise.shape[:-3], n, (n - 1) * feature_dim)
 
 
