@@ -770,125 +770,238 @@ def run_online_oracle_global_belief_evaluation(
                 dtype=true_next_local_states.dtype,
             )
 
-            belief_after_ego, _ = direct_agent_observation_update(
-                predicted_belief=predicted_belief,
-                observed_agent_id=ego_agent_id,
-                measurement=true_next_local_states[
-                    ego_agent_id
-                ][None, ...],
-                measurement_covariance=measurement_covariance,
-                num_agents=num_agents,
-                local_state_dim=local_state_dim,
-            )
+            if communication_mode == "sender_position_triggered":
+                pre_communication_belief = predicted_belief
+                belief_after_ego = predicted_belief
 
-            pre_communication_belief = belief_after_ego
-            belief = belief_after_ego
+                for agent_id in communicating_agent_ids:
+                    estimated_state = extract_agent_state(
+                        belief=pre_communication_belief,
+                        agent_id=agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
 
-            for remote_agent_id in remote_agent_ids:
-                estimated_remote_state = extract_agent_state(
-                    belief=pre_communication_belief,
-                    agent_id=remote_agent_id,
+                    true_state = true_next_local_states[
+                        agent_id
+                    ][None, ...]
+
+                    state_mse = jnp.mean(
+                        (estimated_state - true_state) ** 2
+                    )
+
+                    local_covariance = extract_agent_covariance(
+                        belief=pre_communication_belief,
+                        agent_id=agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
+
+                    covariance_proxy = covariance_trace_per_dim(
+                        local_covariance
+                    )[0]
+
+                    pre_update_remote_mse_values.append(
+                        float(state_mse)
+                    )
+
+                    pre_update_covariance_proxy_values.append(
+                        float(covariance_proxy)
+                    )
+
+                communication_decisions = decide_sender_broadcasts(
+                    predicted_common_belief=pre_communication_belief,
+                    true_local_states=true_next_local_states,
+                    sender_agent_ids=sender_agent_ids,
+                    sender_error_threshold=sender_error_threshold,
+                    sender_covariance_radius_threshold=(
+                        sender_covariance_radius_threshold
+                    ),
+                    sender_covariance_scale=sender_covariance_scale,
                     num_agents=num_agents,
                     local_state_dim=local_state_dim,
                 )
 
-                true_remote_state = true_next_local_states[
-                    remote_agent_id
-                ][None, ...]
+                belief = pre_communication_belief
 
-                remote_mse = jnp.mean(
-                    (estimated_remote_state - true_remote_state) ** 2
-                )
+                for sender_agent_id in sender_agent_ids:
+                    if not communication_decisions[sender_agent_id]:
+                        continue
 
-                remote_covariance = extract_agent_covariance(
-                    belief=pre_communication_belief,
-                    agent_id=remote_agent_id,
-                    num_agents=num_agents,
-                    local_state_dim=local_state_dim,
-                )
+                    belief, _ = direct_agent_observation_update(
+                        predicted_belief=belief,
+                        observed_agent_id=sender_agent_id,
+                        measurement=true_next_local_states[
+                            sender_agent_id
+                        ][None, ...],
+                        measurement_covariance=measurement_covariance,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
 
-                covariance_proxy = covariance_trace_per_dim(
-                    remote_covariance
-                )[0]
+                    total_remote_messages += 1
+                    remote_message_counts[sender_agent_id] += 1
+                    episode_message_count += 1
 
-                pre_update_remote_mse_values.append(
-                    float(remote_mse)
-                )
+                for agent_id in communicating_agent_ids:
+                    estimated_state = extract_agent_state(
+                        belief=belief,
+                        agent_id=agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
 
-                pre_update_covariance_proxy_values.append(
-                    float(covariance_proxy)
-                )
+                    true_state = true_next_local_states[
+                        agent_id
+                    ][None, ...]
 
-            communication_decisions = decide_remote_communications(
-                communication_mode=communication_mode,
-                belief_before_remote_messages=pre_communication_belief,
-                remote_agent_ids=remote_agent_ids,
-                step_index=step_index,
-                periodic_interval=periodic_interval,
-                event_trigger_threshold=event_trigger_threshold,
-                position_trigger_radius=position_trigger_radius,
-                position_trigger_scale=position_trigger_scale,
-                num_agents=num_agents,
-                local_state_dim=local_state_dim,
-            )
+                    state_mse = jnp.mean(
+                        (estimated_state - true_state) ** 2
+                    )
 
-            for remote_agent_id in remote_agent_ids:
-                if not communication_decisions[remote_agent_id]:
-                    continue
+                    local_covariance = extract_agent_covariance(
+                        belief=belief,
+                        agent_id=agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
 
-                belief, _ = direct_agent_observation_update(
-                    predicted_belief=belief,
-                    observed_agent_id=remote_agent_id,
+                    covariance_proxy = covariance_trace_per_dim(
+                        local_covariance
+                    )[0]
+
+                    post_update_remote_mse_values.append(
+                        float(state_mse)
+                    )
+
+                    post_update_covariance_proxy_values.append(
+                        float(covariance_proxy)
+                    )
+
+                    episode_post_update_mse_values.append(
+                        float(state_mse)
+                    )
+
+            else:
+                belief_after_ego, _ = direct_agent_observation_update(
+                    predicted_belief=predicted_belief,
+                    observed_agent_id=ego_agent_id,
                     measurement=true_next_local_states[
-                        remote_agent_id
+                        ego_agent_id
                     ][None, ...],
                     measurement_covariance=measurement_covariance,
                     num_agents=num_agents,
                     local_state_dim=local_state_dim,
                 )
 
-                total_remote_messages += 1
-                remote_message_counts[remote_agent_id] += 1
-                episode_message_count += 1
+                pre_communication_belief = belief_after_ego
+                belief = belief_after_ego
 
-            for remote_agent_id in remote_agent_ids:
-                estimated_remote_state = extract_agent_state(
-                    belief=belief,
-                    agent_id=remote_agent_id,
+                for remote_agent_id in remote_agent_ids:
+                    estimated_remote_state = extract_agent_state(
+                        belief=pre_communication_belief,
+                        agent_id=remote_agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
+
+                    true_remote_state = true_next_local_states[
+                        remote_agent_id
+                    ][None, ...]
+
+                    remote_mse = jnp.mean(
+                        (estimated_remote_state - true_remote_state) ** 2
+                    )
+
+                    remote_covariance = extract_agent_covariance(
+                        belief=pre_communication_belief,
+                        agent_id=remote_agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
+
+                    covariance_proxy = covariance_trace_per_dim(
+                        remote_covariance
+                    )[0]
+
+                    pre_update_remote_mse_values.append(
+                        float(remote_mse)
+                    )
+
+                    pre_update_covariance_proxy_values.append(
+                        float(covariance_proxy)
+                    )
+
+                communication_decisions = decide_remote_communications(
+                    communication_mode=communication_mode,
+                    belief_before_remote_messages=pre_communication_belief,
+                    remote_agent_ids=remote_agent_ids,
+                    step_index=step_index,
+                    periodic_interval=periodic_interval,
+                    event_trigger_threshold=event_trigger_threshold,
+                    position_trigger_radius=position_trigger_radius,
+                    position_trigger_scale=position_trigger_scale,
                     num_agents=num_agents,
                     local_state_dim=local_state_dim,
                 )
 
-                true_remote_state = true_next_local_states[
-                    remote_agent_id
-                ][None, ...]
+                for remote_agent_id in remote_agent_ids:
+                    if not communication_decisions[remote_agent_id]:
+                        continue
 
-                remote_mse = jnp.mean(
-                    (estimated_remote_state - true_remote_state) ** 2
-                )
+                    belief, _ = direct_agent_observation_update(
+                        predicted_belief=belief,
+                        observed_agent_id=remote_agent_id,
+                        measurement=true_next_local_states[
+                            remote_agent_id
+                        ][None, ...],
+                        measurement_covariance=measurement_covariance,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
 
-                remote_covariance = extract_agent_covariance(
-                    belief=belief,
-                    agent_id=remote_agent_id,
-                    num_agents=num_agents,
-                    local_state_dim=local_state_dim,
-                )
+                    total_remote_messages += 1
+                    remote_message_counts[remote_agent_id] += 1
+                    episode_message_count += 1
 
-                covariance_proxy = covariance_trace_per_dim(
-                    remote_covariance
-                )[0]
+                for remote_agent_id in remote_agent_ids:
+                    estimated_remote_state = extract_agent_state(
+                        belief=belief,
+                        agent_id=remote_agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
 
-                post_update_remote_mse_values.append(
-                    float(remote_mse)
-                )
+                    true_remote_state = true_next_local_states[
+                        remote_agent_id
+                    ][None, ...]
 
-                post_update_covariance_proxy_values.append(
-                    float(covariance_proxy)
-                )
+                    remote_mse = jnp.mean(
+                        (estimated_remote_state - true_remote_state) ** 2
+                    )
 
-                episode_post_update_mse_values.append(
-                    float(remote_mse)
-                )
+                    remote_covariance = extract_agent_covariance(
+                        belief=belief,
+                        agent_id=remote_agent_id,
+                        num_agents=num_agents,
+                        local_state_dim=local_state_dim,
+                    )
+
+                    covariance_proxy = covariance_trace_per_dim(
+                        remote_covariance
+                    )[0]
+
+                    post_update_remote_mse_values.append(
+                        float(remote_mse)
+                    )
+
+                    post_update_covariance_proxy_values.append(
+                        float(covariance_proxy)
+                    )
+
+                    episode_post_update_mse_values.append(
+                        float(remote_mse)
+                    )
 
             if trace_this_episode:
                 communication_mask = np.zeros(
@@ -896,10 +1009,10 @@ def run_online_oracle_global_belief_evaluation(
                     dtype=np.bool_,
                 )
 
-                for remote_agent_id in remote_agent_ids:
-                    communication_mask[remote_agent_id] = (
-                        communication_decisions[remote_agent_id]
-                    )
+                for agent_id, should_communicate in (
+                        communication_decisions.items()
+                ):
+                    communication_mask[agent_id] = should_communicate
 
                 trace_steps["true_local_states"].append(
                     np.asarray(true_next_local_states)
@@ -1090,7 +1203,7 @@ def run_online_oracle_global_belief_evaluation(
         )
 
     maximum_remote_messages = (
-        total_environment_steps * len(remote_agent_ids)
+            total_environment_steps * len(communicating_agent_ids)
     )
 
     remote_message_rate = (
@@ -1135,6 +1248,11 @@ def run_online_oracle_global_belief_evaluation(
         "post_update_covariance_proxy": jnp.asarray(
             post_update_covariance_proxy_values
         ),
+        "sender_error_threshold": sender_error_threshold,
+        "sender_covariance_radius_threshold": (
+            sender_covariance_radius_threshold
+        ),
+        "sender_covariance_scale": sender_covariance_scale,
     }
 
     print("\n===== Online Evaluation Summary =====")
@@ -1162,10 +1280,10 @@ def run_online_oracle_global_belief_evaluation(
         f"Remote message rate: {remote_message_rate:.4f}"
     )
 
-    for remote_agent_id in remote_agent_ids:
+    for agent_id in communicating_agent_ids:
         print(
-            f"Messages from agent_{remote_agent_id}: "
-            f"{remote_message_counts[remote_agent_id]}"
+            f"Messages from agent_{agent_id}: "
+            f"{remote_message_counts[agent_id]}"
         )
 
     return metrics
