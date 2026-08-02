@@ -1,0 +1,4 @@
+flax>=0.8
+optax>=0.2
+wandb>=0.17
+PyYAML>=6.0

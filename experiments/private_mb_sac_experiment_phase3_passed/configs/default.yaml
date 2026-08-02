@@ -1,0 +1,121 @@
+experiment:
+  name: private_mb_sac
+  seed: 0
+  num_agents: 3
+  num_landmarks: 3
+  max_steps: 25
+synchronization:
+  rounds: 200
+  exchange_actor_snapshots_only: true
+  average_actor_parameters: false
+  freeze_snapshots_within_round: true
+collection:
+  num_envs_per_owner: 12
+  rollout_length: 25
+  real_transitions_per_owner_per_round: 300
+  common_environment_rng_schedule: true
+  distinct_policy_rng_streams: true
+replay:
+  real_capacity: 50000
+  model_capacity: 50000
+  batch_size: 1024
+  real_fraction_in_sac_batch: 0.5
+actor:
+  observation_dim: 18
+  action_dim: 2
+  hidden_dims:
+  - 256
+  - 256
+  learning_rate: 0.0003
+  normalization: common_frozen
+  normalization_calibration:
+    enabled: true
+    num_envs: 12
+    rollout_length: 25
+    rounds: 4
+    clip: 10.0
+    minimum_std: 0.001
+critic:
+  state_dim: 18
+  joint_action_dim: 6
+  hidden_dims:
+  - 256
+  - 256
+  learning_rate: 0.0003
+  tau: 0.005
+  gamma: 0.99
+  updates_per_round: 100
+temperature:
+  initial_alpha: 0.2
+  learning_rate: 0.0003
+  target_entropy: -2.0
+dynamics:
+  ensemble_size: 5
+  input_dim: 24
+  output_dim: 12
+  hidden_dims:
+  - 256
+  - 256
+  - 256
+  learning_rate: 0.0003
+  updates_per_round: 50
+  min_logvar: -6.0
+  max_logvar: 0.5
+  exclude_terminal_transitions: true
+  bootstrap_members: true
+  maximum_gradient_norm: 10.0
+  normalization_mode: frozen_after_warmup
+  normalization_min_samples: 256
+  normalization_min_std: 0.001
+  normalization_clip: 10.0
+  evaluation_batch_size: 1024
+model_rollout:
+  batch_size: 1024
+  horizon_min: 1
+  horizon_max: 6
+  schedule_start_round: 15
+  schedule_end_round: 100
+  terminate_on_done: true
+  terminate_on_collision: true
+  terminate_on_uncertainty: true
+  communication_enabled: false
+  opponent_model_enabled: false
+  stochastic_policy_actions: true
+  stochastic_dynamics: true
+  uncertainty_metric: max_epistemic_variance
+  uncertainty_quantile: 0.99
+  uncertainty_multiplier: 1.5
+  uncertainty_min_samples: 256
+  uncertainty_epsilon: 1.0e-08
+  reward_validation_batch_size: 1024
+  reward_validation_tolerance: 1.0e-05
+evaluation:
+  interval_rounds: 1
+  num_envs: 64
+  environment_seed: 30
+  deterministic_actions: true
+checkpoint:
+  interval_rounds: 10
+  save_best: true
+  save_latest: true
+tracking:
+  enabled: true
+  provider: wandb
+  project: private-mb-sac-snapshot-sync
+  entity: null
+  group: simple-spread-private-mb-sac
+  job_type: train
+  mode: offline
+  tags:
+  - simple-spread
+  - private-replay
+  - model-based-sac
+  - actor-snapshot-sync
+  - five-member-ensemble
+  - no-communication
+  run_name_template: private_mb_sac_seed{seed}_rounds{rounds}_ensemble{ensemble_size}
+  log_interval_rounds: 1
+  evaluation_log_interval_rounds: 1
+  watch_models: false
+  watch_log_frequency: 1000
+  save_code: true

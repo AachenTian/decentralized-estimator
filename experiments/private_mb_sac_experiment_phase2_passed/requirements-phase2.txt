@@ -1,0 +1,5 @@
+# Use the JAX build already installed in the project environment.
+flax
+optax
+wandb>=0.17
+PyYAML>=6.0
